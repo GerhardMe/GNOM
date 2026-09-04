@@ -22,9 +22,9 @@ in {
     EDITOR = "nvim";
     BROWSER = "firefox";
   };
-  systemd.user.extraConfig = ''
-    ImportEnvironment=DISPLAY XAUTHORITY
-  ''; # SUSPECT
+  systemd.user.settings.Manager = {
+    ImportEnvironment = "DISPLAY XAUTHORITY";
+  };
   xdg.mime = {
     enable = true;
     defaultApplications = {
@@ -50,6 +50,7 @@ in {
       efiSupport = true;
       enableCryptodisk = true;
       device = "nodev";
+      configurationLimit = 10;
     };
     timeout = 1;
   };
@@ -319,19 +320,27 @@ in {
   '';
 };
 
-  # Nix garbage collection (monthly, keep only last 180 days)
+  # Nix garbage collection (weekly, keep only last 30 days)
   nix = {
     settings = {
       auto-optimise-store = true;
-      # keep-outputs = false;
-      # keep-derivations = false;
+      keep-outputs = true;      # keep build outputs of installed packages
+      keep-derivations = true;  # keep .drv files so builds can be reproduced
     };
     gc = {
       automatic = true;
-      dates = "monthly";
-      options = "--delete-older-than 180d";
+      dates = "weekly";
+      options = "--delete-older-than 30d";
       # persistent = true; # (default is true; ensures missed runs happen later)
     };
+  };
+
+  # nix-direnv: creates GC roots for dev environments so they survive garbage
+  # collection — without this, `nix develop` packages have no GC root and get
+  # collected even though the flake hasn't changed
+  programs.direnv = {
+    enable = true;
+    nix-direnv.enable = true;
   };
 
 
