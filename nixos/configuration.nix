@@ -60,10 +60,50 @@ in {
     options nvidia-drm modeset=1
     options thinkpad_acpi fan_control=1
   '';
+  # Swap is >= RAM (24 GB) so a full memory image fits when hibernating.
   swapDevices = [{
     device = "/var/lib/swapfile";
-    size = 16 * 1024;
+    size = 32 * 1024;
   }];
+
+  # --- Hibernate / resume ---
+  # The swapfile lives on the LUKS-encrypted ext4 root, so any hibernation
+  # image is encrypted at rest. initrd already unlocks that device for root;
+  # resumeDevice points the kernel at it, and resume_offset says where in it
+  # the swapfile starts.
+  #
+  # resume_offset MUST be regenerated whenever the swapfile is (re)created,
+  # e.g. after changing `size` above. Rollout:
+  #   1. Rebuild once with the two lines below still commented (this writes the
+  #      new 32 GB swapfile; sleep behaviour is unchanged).
+  #   2. Read the offset (first physical block of the file):
+  #        sudo filefrag -v /var/lib/swapfile | awk 'NR==4 {print $4+0}'
+  #   3. Uncomment both lines, drop the number into resume_offset, flip the
+  #      lidSwitch/powerKey values in the POWER section, rebuild again.
+  # boot.resumeDevice = config.fileSystems."/".device;
+  # boot.kernelParams = [ "resume_offset=CHANGE_ME" ];
+
+  # ------------------------------------------------------------------------------------------
+  # ----------------------------------------- POWER ----------------------------------------
+  # ------------------------------------------------------------------------------------------
+
+  # Lid close / power key: suspend to RAM now (instant resume), then after
+  # HibernateDelaySec of sleeping, wake briefly and hibernate to disk so a
+  # forgotten laptop ends up at zero battery draw instead of dying flat.
+  # Inhibitors still win, so "server mode" (awake.service) keeps it awake.
+  #
+  # IMPORTANT: keep these as plain "suspend" until resume_offset is set in the
+  # BOOT section above — otherwise a hibernate has nothing to resume from and
+  # the session is lost on next boot. Flip to "suspend-then-hibernate" in the
+  # same rebuild that adds the offset.
+  services.logind = {
+    lidSwitch = "suspend"; # -> "suspend-then-hibernate" once resume_offset is set
+    lidSwitchExternalPower = "suspend";
+    powerKey = "suspend"; # -> "suspend-then-hibernate" once resume_offset is set
+  };
+  systemd.sleep.extraConfig = ''
+    HibernateDelaySec=45min
+  '';
 
   # ------------------------------------------------------------------------------------------
   # ----------------------------------------- USER -----------------------------------------
