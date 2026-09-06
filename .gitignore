@@ -1,3 +1,6 @@
 .claude/
 .opencode/
+.aider*
+.cursor/
+.copilot/
 result
