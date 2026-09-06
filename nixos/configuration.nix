@@ -73,15 +73,10 @@ in {
   # the swapfile starts.
   #
   # resume_offset MUST be regenerated whenever the swapfile is (re)created,
-  # e.g. after changing `size` above. Rollout:
-  #   1. Rebuild once with the two lines below still commented (this writes the
-  #      new 32 GB swapfile; sleep behaviour is unchanged).
-  #   2. Read the offset (first physical block of the file):
-  #        sudo filefrag -v /var/lib/swapfile | awk 'NR==4 {print $4+0}'
-  #   3. Uncomment both lines, drop the number into resume_offset, flip the
-  #      lidSwitch/powerKey values in the POWER section, rebuild again.
-  # boot.resumeDevice = config.fileSystems."/".device;
-  # boot.kernelParams = [ "resume_offset=CHANGE_ME" ];
+  # e.g. after changing `size` above. Re-read it with:
+  #   sudo filefrag -v /var/lib/swapfile | awk 'NR==4 {print $4+0}'
+  boot.resumeDevice = config.fileSystems."/".device;
+  boot.kernelParams = [ "resume_offset=589824" ];
 
   # ------------------------------------------------------------------------------------------
   # ----------------------------------------- POWER ----------------------------------------
@@ -91,19 +86,19 @@ in {
   # HibernateDelaySec of sleeping, wake briefly and hibernate to disk so a
   # forgotten laptop ends up at zero battery draw instead of dying flat.
   # Inhibitors still win, so "server mode" (awake.service) keeps it awake.
-  #
-  # IMPORTANT: keep these as plain "suspend" until resume_offset is set in the
-  # BOOT section above — otherwise a hibernate has nothing to resume from and
-  # the session is lost on next boot. Flip to "suspend-then-hibernate" in the
-  # same rebuild that adds the offset.
-  services.logind = {
-    lidSwitch = "suspend"; # -> "suspend-then-hibernate" once resume_offset is set
-    lidSwitchExternalPower = "suspend";
-    powerKey = "suspend"; # -> "suspend-then-hibernate" once resume_offset is set
+  services.logind.settings.Login = {
+    HandleLidSwitch = "suspend-then-hibernate";
+    HandleLidSwitchExternalPower = "suspend";
+    HandlePowerKey = "suspend-then-hibernate";
   };
-  systemd.sleep.extraConfig = ''
-    HibernateDelaySec=45min
-  '';
+  systemd.sleep.settings.Sleep = {
+    HibernateDelaySec = "1h";
+    HibernateOnACPower = "no"; # on AC (eGPU dock) stay in cheap S3; only hibernate on battery
+  };
+
+  # Keep the 32 GB swap mostly empty so a hibernation image always fits, and
+  # spare the SSD writes. 24 GB RAM means real swap pressure is rare anyway.
+  boot.kernel.sysctl."vm.swappiness" = 10;
 
   # ------------------------------------------------------------------------------------------
   # ----------------------------------------- USER -----------------------------------------
