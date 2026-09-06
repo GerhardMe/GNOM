@@ -26,6 +26,9 @@ echo "Started idle screen lock"
 # Set upp screen off rule
 xset dpms 0 0 900 # Turn off screen after 15min.
 
+# Disable the X bell (water-drop sound on invalid input in GTK apps etc.)
+xset -b
+
 # Kill and restart udiskie
 pkill udiskie
 sleep 0.1 && udiskie &

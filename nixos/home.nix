@@ -116,6 +116,10 @@ gtk = {
     package = pkgs.gnome-themes-extra;
   };
   gtk4.theme = null;
+  # Disable the audible error bell (water-drop sound on invalid input)
+  gtk2.extraConfig = "gtk-error-bell = 0";
+  gtk3.extraConfig."gtk-error-bell" = false;
+  gtk4.extraConfig."gtk-error-bell" = false;
 };
 
   # ------------------------------------------------------------------------------------------
