@@ -140,6 +140,22 @@ get_hostname() {
 	sed -n 's/^[[:space:]]*hostname[[:space:]]*=[[:space:]]*"\([^"]*\)".*/\1/p' "$USER_DIR/userprofile.nix"
 }
 
+# -------------------- Post-rebuild maintenance --------------------
+# Runs only after a successful `nixos-rebuild switch`, in the same breath
+# as the freshly regenerated GRUB menu — so the menu can never reference
+# paths that generation pruning / garbage collection just removed.
+cleanup() {
+	step "Pruning to last 5 generations…"
+	sudo nix-env -p /nix/var/nix/profiles/system --delete-generations +5
+	nix-env --delete-generations +5 # own profile (home-manager generations)
+
+	step "Collecting garbage (failed builds, unreachable paths)…"
+	sudo nix-collect-garbage
+
+	step "Pruning dev-shell roots unused for 200 days…"
+	find "$HOME/.cache/gnoms/shells" -maxdepth 1 -type l -mtime +200 -delete 2>/dev/null || true
+}
+
 rebuild() {
 	sudo -v # ask for the password up front, before any output
 
@@ -160,6 +176,7 @@ rebuild() {
 	sudo nixos-rebuild switch --flake "$TARGET_DIR#$(get_hostname)" 2>&1 | tee >(grep --color error >&2) || false
 	success "System rebuild complete."
 
+	cleanup
 	reload
 }
 

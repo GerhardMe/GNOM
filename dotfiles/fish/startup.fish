@@ -105,6 +105,12 @@ if status is-interactive
     # ----------------------------------------------------------------
 
     function dev
+        # Build (not enter) the devShell first to create a persistent GC
+        # root under ~/.cache/gnoms/shells, so garbage collection can't
+        # wipe the shell of a project you're in. Refreshed on every run.
+        mkdir -p "$HOME/.cache/gnoms/shells"
+        nix build --no-link --out-link "$HOME/.cache/gnoms/shells/"(basename "$PWD") \
+            ".#devShells."(nix config show system)".default" 2>/dev/null
         nix develop --command fish $argv
     end
 

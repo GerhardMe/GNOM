@@ -59,7 +59,7 @@ in {
       efiSupport = true;
       enableCryptodisk = true;
       device = "nodev";
-      configurationLimit = 10;
+      configurationLimit = 5;
       useOSProber = true; # pick up Windows/other installs for dual-boot
     };
     timeout = 1;
@@ -366,18 +366,19 @@ in {
   '';
 };
 
-  # Nix garbage collection (weekly, keep only last 30 days)
+  # Nix garbage collection
+  # The weekly timer only GCs unreachable paths — it must NEVER delete
+  # generations. Generation pruning happens in reconfigure.sh immediately
+  # after a successful rebuild, so the freshly regenerated GRUB menu can
+  # never reference paths that garbage collection removed.
   nix = {
     settings = {
       auto-optimise-store = true;
-      keep-outputs = true;      # keep build outputs of installed packages
-      keep-derivations = true;  # keep .drv files so builds can be reproduced
     };
     gc = {
       automatic = true;
       dates = "weekly";
-      options = "--delete-older-than 30d";
-      # persistent = true; # (default is true; ensures missed runs happen later)
+      # default options: plain `nix-collect-garbage` (no generation deletion)
     };
   };
 
