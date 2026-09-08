@@ -141,6 +141,8 @@ get_hostname() {
 }
 
 rebuild() {
+	sudo -v # ask for the password up front, before any output
+
 	step "Copying flake files into $TARGET_DIR…"
 	for file in flake.nix configuration.nix home.nix flake.lock; do
 		sudo cp -f "$REPO_DIR/$file" "$TARGET_DIR/$file"
@@ -162,6 +164,8 @@ rebuild() {
 }
 
 update() {
+	sudo -v # ask for the password up front, before any output
+
 	step "Updating flake.lock in $TARGET_DIR…"
 	sudo nix flake update --flake "$TARGET_DIR"
 
