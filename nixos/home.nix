@@ -1,4 +1,14 @@
-{ system, nixpkgs, config, home-manager, pkgs, ... }: {
+{ system, nixpkgs, config, home-manager, pkgs, ... }:
+let
+  # user/ holds your profile: ./user when running from a synced copy in
+  # /etc/nixos, ../user when evaluating inside the repo.
+  profile = import (if builtins.pathExists ./user
+    then ./user/userprofile.nix
+    else ../user/userprofile.nix);
+  userprograms = import (if builtins.pathExists ./user
+    then ./user/userprograms.nix
+    else ../user/userprograms.nix) { inherit pkgs; };
+in {
 
   # ------------------------------------------------------------------------------------------
   # ----------------------------------------- SETTINGS ---------------------------------------
@@ -133,9 +143,7 @@ gtk = {
     xwallpaper
     papirus-icon-theme
     fastfetch
-
-    {{user_programs}}
-  ];
+  ] ++ userprograms.user;
 
   # ------------------------------------------------------------------------------------------
   # ---------------------------------------- NEOVIM ------------------------------------------
@@ -157,8 +165,8 @@ gtk = {
   programs.git = {
     enable = true;
     settings.user = {
-      name = "{{github_name}}";
-      email = "{{github_email}}";
+      name = profile.github_name;
+      email = profile.github_email;
     };
     signing.format = null;
   };

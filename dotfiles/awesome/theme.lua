@@ -16,7 +16,7 @@ local theme = {}
 theme.font = "JetBrains Mono SemiBold 10"
 
 -- Backgrounds
-theme.bg_normal = "{{bar_color}}" -- bar background, matches terminal top-fade colour
+theme.bg_normal = "#424242" -- bar background, matches terminal top-fade colour
 theme.bg_focus = "#8700ff" -- focused workspace background
 theme.bg_urgent = "#900000" -- urgent background (i3 used this behind red border)
 theme.bg_minimize = "#8700ff" -- matches inactive workspace background
@@ -103,7 +103,7 @@ theme.titlebar_maximized_button_focus_inactive = themes_path .. "default/titleba
 theme.titlebar_maximized_button_normal_active = themes_path .. "default/titlebar/maximized_normal_active.png"
 theme.titlebar_maximized_button_focus_active = themes_path .. "default/titlebar/maximized_focus_active.png"
 
-theme.wallpaper = os.getenv("HOME") .. "/GNOMS/personal/wallpaper.jpeg"
+theme.wallpaper = os.getenv("HOME") .. "/GNOMS/user/wallpaper.jpeg"
 
 -- You can use your own layout icons like this:
 

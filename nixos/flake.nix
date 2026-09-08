@@ -13,12 +13,15 @@
     let
       system = "x86_64-linux";
       pkgs = import nixpkgs { inherit system; };
+      # user/ holds your profile: ./user when running from a synced copy in
+      # /etc/nixos, ../user when evaluating inside the repo.
+      profile = import (if builtins.pathExists ./user
+        then ./user/userprofile.nix
+        else ../user/userprofile.nix);
     in {
       # NixOS system configuration
-      # NOTE: attr names are quoted so the un-templated repo flake still
-      # parses (needed for `nix build ./nixos#iso`); templating fills them in.
       nixosConfigurations = {
-        "{{hostname}}" = nixpkgs.lib.nixosSystem {
+        "${profile.hostname}" = nixpkgs.lib.nixosSystem {
           inherit system;
           modules = [
             ./configuration.nix
@@ -26,7 +29,7 @@
 
             # Configure Home Manager user to import home.nix
             ({ config, lib, pkgs, ... }: {
-              home-manager.users."{{username}}" = { imports = [ ./home.nix ]; };
+              home-manager.users."${profile.username}" = { imports = [ ./home.nix ]; };
             })
           ];
         };

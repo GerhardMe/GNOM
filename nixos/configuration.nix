@@ -1,6 +1,15 @@
 { pkgs, config, ... }:
 
 let
+  # user/ holds your profile: ./user when running from a synced copy in
+  # /etc/nixos, ../user when evaluating inside the repo.
+  profile = import (if builtins.pathExists ./user
+    then ./user/userprofile.nix
+    else ../user/userprofile.nix);
+  userprograms = import (if builtins.pathExists ./user
+    then ./user/userprograms.nix
+    else ../user/userprograms.nix) { inherit pkgs; };
+
   rootTriggerScript = pkgs.writeScript "log-hw-event" ''
     #!${pkgs.runtimeShell}
     touch "/tmp/hw-trigger-$(date +%s)-$1"
@@ -14,7 +23,7 @@ in {
   imports = [ ./hardware-configuration.nix ];
   nix.settings.experimental-features = [ "nix-command" "flakes" ];
   programs.command-not-found.enable = false;
-  networking.hostName = "{{hostname}}";
+  networking.hostName = profile.hostname;
 
   # ENV varriables
   environment.variables = {
@@ -75,10 +84,10 @@ in {
   #
   # resume_offset MUST be regenerated whenever the swapfile is (re)created,
   # e.g. after changing `size` above. The installer computes it automatically;
-  # to update it later, set it in personal/profile.conf and rebuild:
+  # to update it later, set it in user/userprofile.nix and rebuild:
   #   sudo filefrag -v /var/lib/swapfile | awk 'NR==4 {print $4+0}'
   boot.resumeDevice = config.fileSystems."/".device;
-  boot.kernelParams = [ "resume_offset={{resume_offset}}" ];
+  boot.kernelParams = [ "resume_offset=${toString profile.resume_offset}" ];
 
   # ------------------------------------------------------------------------------------------
   # ----------------------------------------- POWER ----------------------------------------
@@ -106,7 +115,7 @@ in {
   # ----------------------------------------- USER -----------------------------------------
   # ------------------------------------------------------------------------------------------
 
-  users.users.{{username}} = {
+  users.users.${profile.username} = {
     isNormalUser = true;
     extraGroups = [ "networkmanager" "wheel" "dialout" "audio" "jackaudio" ];
     shell = pkgs.fish;
@@ -116,18 +125,18 @@ in {
   programs.fish.enable = true;
 
   # Language and locale
-  time.timeZone = "{{timezone}}";
-  i18n.defaultLocale = "{{locale}}";
+  time.timeZone = profile.timezone;
+  i18n.defaultLocale = profile.locale;
   i18n.extraLocaleSettings = {
-    LC_ADDRESS = "{{locale}}";
-    LC_IDENTIFICATION = "{{locale}}";
-    LC_MEASUREMENT = "{{locale}}";
-    LC_MONETARY = "{{locale}}";
-    LC_NAME = "{{locale}}";
-    LC_NUMERIC = "{{locale}}";
-    LC_PAPER = "{{locale}}";
-    LC_TELEPHONE = "{{locale}}";
-    LC_TIME = "{{locale}}";
+    LC_ADDRESS = profile.locale;
+    LC_IDENTIFICATION = profile.locale;
+    LC_MEASUREMENT = profile.locale;
+    LC_MONETARY = profile.locale;
+    LC_NAME = profile.locale;
+    LC_NUMERIC = profile.locale;
+    LC_PAPER = profile.locale;
+    LC_TELEPHONE = profile.locale;
+    LC_TIME = profile.locale;
   };
 
   # ------------------------------------------------------------------------------------------
@@ -141,9 +150,9 @@ in {
   };
 
   # Keyboard layout
-  console.keyMap = "no";
+  console.keyMap = profile.keyboard_layout;
   services.xserver.xkb = {
-    layout = "no";
+    layout = profile.keyboard_layout;
     options = "lv3:ralt_switch";
   };
 
@@ -167,7 +176,7 @@ in {
       sddm.enable = true;
       defaultSession = "none+awesome";
       autoLogin.enable = true;
-      autoLogin.user = "{{username}}";
+      autoLogin.user = profile.username;
     };
   };
   programs.i3lock.enable = true;
@@ -253,7 +262,7 @@ in {
 
   security.polkit.enable = true; # managing user premitions
   security.sudo.extraRules = [{
-    users = [ "{{username}}" ];
+    users = [ profile.username ];
     commands = [
       {
         command = "${pkgs.systemd}/bin/systemctl start sshd";
@@ -523,8 +532,7 @@ in {
     man-pages
     man-pages-posix
 
-    {{system_programs}}
-  ];
+  ] ++ userprograms.system;
   documentation.dev.enable = true;
   documentation.man = {
     man-db.enable = false;
@@ -538,8 +546,8 @@ in {
   services.syncthing = {
     enable = true;
     group = "users";
-    user = "{{username}}";
-    configDir = "/home/{{username}}/.config/syncthing";
+    user = profile.username;
+    configDir = "/home/${profile.username}/.config/syncthing";
   }; # GUI on http://127.0.0.1:8384/
 
   # ------------------------------------------------------------------------------------------

@@ -1,30 +1,14 @@
-# This is your profile.
-# It is a way to manage personal data, like name, email and personal programs. (not a secret)
+# Programs you want installed.
+#   system : available to all users (added to configuration.nix)
+#   user   : installed for your user only (added to home.nix)
+# Add package names exactly as they appear on https://search.nixos.org
 
-# Example: hostname replaces all {{hostname}} in all files within /nixos on rebuild.
-# You may add custum keys.
+{ pkgs, ... }: with pkgs; {
+  system = [
 
-hostname = gnoms
+  ];
 
-# Where the swapfile starts on disk (hibernate). The installer computes this;
-# if you ever recreate the swapfile, update it (see configuration.nix comment).
-resume_offset = 589824
-
-bar_color = #424242
-
-username = gg
-
-timezone = Europe/Oslo
-locale = en_GB.UTF-8
-
-github_name = Gerhard
-github_email = gerhard.git@proton.me
-
-system_programs = {
-
-}
-
-user_programs = {
+  user = [
     # Big programs:
     slack
     spotify
@@ -71,10 +55,11 @@ user_programs = {
     obsidian
     libreoffice
 
-    # Fun:    
+    # Fun:
     cmatrix
     pipes
     cava
     asciiquarium-transparent
     sl
+  ];
 }

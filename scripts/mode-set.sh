@@ -6,7 +6,7 @@ SERVICE="awake.service"
 
 # Colors
 SERVER_COLOR="#002199b2"      # blue in server mode
-NORMAL_COLOR=$(grep '^bar_color' "$HOME/GNOMS/personal/profile.conf" | sed 's/.*=[[:space:]]*//')
+NORMAL_COLOR=$(sed -n 's/.*theme.bg_normal[[:space:]]*=[[:space:]]*"\([^"]*\)".*/\1/p' "$HOME/GNOMS/dotfiles/awesome/theme.lua")
 NORMAL_COLOR="${NORMAL_COLOR:-#424242}"
 PERFORMANCE_COLOR="#400050b2" # red in performance mode
 

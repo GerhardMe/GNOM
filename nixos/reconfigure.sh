@@ -14,66 +14,6 @@ COREDOT="$HOME/GNOMS/dotfiles"
 DOT="$HOME/.config"
 CORESCR="$HOME/GNOMS/scripts"
 EXE="$HOME/.local/bin"
-PROFILE="$HOME/GNOMS/personal/profile.conf"
-
-# --------------- Profile parser -----------------
-declare -A CONFIG
-
-parse_config() {
-	local in_block=""
-	local block_content=""
-
-	while IFS= read -r line || [[ -n "$line" ]]; do
-		# Skip comments and empty lines
-		[[ "$line" =~ ^[[:space:]]*# ]] && continue
-		[[ -z "${line// /}" ]] && continue
-
-		# Check for block end first (when inside a block)
-		if [[ -n "$in_block" ]] && [[ "$line" =~ ^[[:space:]]*\}[[:space:]]*$ ]]; then
-			CONFIG["$in_block"]="$block_content"
-			in_block=""
-			continue
-		fi
-
-		# Inside a block - accumulate content
-		if [[ -n "$in_block" ]]; then
-			local trimmed="${line#"${line%%[![:space:]]*}"}"
-			block_content+="${trimmed}"$'\n'
-			continue
-		fi
-
-		# Check for block start: key = {
-		if [[ "$line" =~ ^([a-z_]+)[[:space:]]*=[[:space:]]*\{[[:space:]]*$ ]]; then
-			in_block="${BASH_REMATCH[1]}"
-			block_content=""
-			continue
-		fi
-
-		# Regular key = value (but not if value is just "{")
-		if [[ "$line" =~ ^([a-z_]+)[[:space:]]*=[[:space:]]*(.+)$ ]]; then
-			local value="${BASH_REMATCH[2]}"
-			[[ "$value" == "{" ]] && continue
-			CONFIG["${BASH_REMATCH[1]}"]="$value"
-		fi
-	done <"$PROFILE"
-}
-
-# Replace all {{key}} patterns in a file using sed
-apply_template() {
-	local input="$1"
-	local output="$2"
-
-	cp "$input" "$output"
-
-	for key in "${!CONFIG[@]}"; do
-		local value="${CONFIG[$key]}"
-		# Escape newlines and special chars for sed
-		value="${value//\\/\\\\}"
-		value="${value//&/\\&}"
-		value="${value//$'\n'/\\n}"
-		sed -i "s|{{${key}}}|${value}|g" "$output"
-	done
-}
 
 # -------------------- Helper functions --------------------
 step() { echo -e "${PURPLE}[  ▶▶  ]${RESET} $1"; }
@@ -133,11 +73,11 @@ hacky_fixes() {
 
 # -------------------- Operations --------------------
 reload() {
-	parse_config
-
 	step "Generating terminal top-edge fade…"
 	TOP_FADE="$HOME/.cache/gnoms/top_fade.png"
-	BAR_COLOR="${CONFIG[bar_color]:-#404040}"
+	# Lua owns the color: read it straight out of the deployed theme
+	BAR_COLOR=$(sed -n 's/.*theme.bg_normal[[:space:]]*=[[:space:]]*"\([^"]*\)".*/\1/p' "$DOT/awesome/theme.lua")
+	BAR_COLOR="${BAR_COLOR:-#404040}"
 	STRIP_H=80
 	W=3840
 	mkdir -p "$(dirname "$TOP_FADE")"
@@ -155,7 +95,7 @@ reload() {
 	copy "$COREDOT/fish/theme.fish" "$DOT/fish/conf.d/fish_frozen_theme.fish"
 	copy "$COREDOT/awesome/main.lua" "$DOT/awesome/rc.lua"
 	copy "$COREDOT/awesome/statusbar.lua" "$DOT/awesome/statusbar.lua"
-	apply_template "$COREDOT/awesome/theme.lua" "$DOT/awesome/theme.lua"
+	copy "$COREDOT/awesome/theme.lua" "$DOT/awesome/theme.lua"
 	copy "$COREDOT/wezterm.lua" "$DOT/wezterm/wezterm.lua"
 	copy "$COREDOT/cava.conf" "$DOT/cava/config"
 	copy "$COREDOT/nvim/init.lua" "$DOT/nvim/init.lua"
