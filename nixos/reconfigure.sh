@@ -14,6 +14,7 @@ COREDOT="$HOME/GNOMS/dotfiles"
 DOT="$HOME/.config"
 CORESCR="$HOME/GNOMS/scripts"
 EXE="$HOME/.local/bin"
+USER_DIR="$HOME/GNOMS/user"
 
 # -------------------- Helper functions --------------------
 step() { echo -e "${PURPLE}[  ▶▶  ]${RESET} $1"; }
@@ -134,35 +135,33 @@ reload() {
 	fi
 }
 
-rebuild() {
-	step "Parsing local config…"
-	parse_config
+# Hostname from user/userprofile.nix (line: hostname = "…";)
+get_hostname() {
+	sed -n 's/^[[:space:]]*hostname[[:space:]]*=[[:space:]]*"\([^"]*\)".*/\1/p' "$USER_DIR/userprofile.nix"
+}
 
-	step "Processing and copying flake files into $TARGET_DIR…"
-	for file in flake.nix configuration.nix home.nix; do
-		apply_template "$REPO_DIR/$file" "/tmp/$file"
-		sudo cp -f "/tmp/$file" "$TARGET_DIR/$file"
-		rm "/tmp/$file"
+rebuild() {
+	step "Copying flake files into $TARGET_DIR…"
+	for file in flake.nix configuration.nix home.nix flake.lock; do
+		sudo cp -f "$REPO_DIR/$file" "$TARGET_DIR/$file"
 	done
 
-	# Copy flake.lock directly without templating
-	sudo cp -f "$REPO_DIR/flake.lock" "$TARGET_DIR/flake.lock"
+	step "Copying profile into $TARGET_DIR/user…"
+	sudo mkdir -p "$TARGET_DIR/user"
+	sudo cp -f "$USER_DIR"/userprofile.nix "$USER_DIR"/userprograms.nix "$TARGET_DIR/user/"
 
-	sudo chown root:root "$TARGET_DIR"/{flake.nix,flake.lock,configuration.nix,home.nix}
-	sudo chmod 644 "$TARGET_DIR"/{flake.nix,flake.lock,configuration.nix,home.nix}
-	success "Flake files templated and updated in $TARGET_DIR"
+	sudo chown root:root "$TARGET_DIR"/{flake.nix,flake.lock,configuration.nix,home.nix} "$TARGET_DIR"/user/*.nix
+	sudo chmod 644 "$TARGET_DIR"/{flake.nix,flake.lock,configuration.nix,home.nix} "$TARGET_DIR"/user/*.nix
+	success "Flake files and profile updated in $TARGET_DIR"
 
 	step "Building new system configuration…"
-	sudo nixos-rebuild switch --flake "$TARGET_DIR#${CONFIG[hostname]}" 2>&1 | tee >(grep --color error >&2) || false
+	sudo nixos-rebuild switch --flake "$TARGET_DIR#$(get_hostname)" 2>&1 | tee >(grep --color error >&2) || false
 	success "System rebuild complete."
 
 	reload
 }
 
 update() {
-	step "Parsing local config…"
-	parse_config
-
 	step "Updating flake.lock in $TARGET_DIR…"
 	sudo nix flake update --flake "$TARGET_DIR"
 
@@ -172,7 +171,7 @@ update() {
 	success "Flake.lock updated and synced back."
 
 	step "Building updated packages (no activation)…"
-	sudo nixos-rebuild build --flake "$TARGET_DIR#${CONFIG[hostname]}" 2>&1 | tee >(grep --color error >&2) || false
+	sudo nixos-rebuild build --flake "$TARGET_DIR#$(get_hostname)" 2>&1 | tee >(grep --color error >&2) || false
 	success "Build complete. Run 'reconfigure rebuild' to activate."
 }
 
