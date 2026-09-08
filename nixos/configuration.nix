@@ -441,7 +441,7 @@ in {
   nixpkgs.config.allowUnfree = true;
   nixpkgs.config.segger-jlink.acceptLicense = true;
   environment.systemPackages = with pkgs; [
-    config.boot.kernelPackages.nvidia_x11
+    config.boot.kernelPackages.nvidia_x11 # NVIDIA driver
 
     # Terminal:
     wezterm
@@ -468,17 +468,17 @@ in {
     probe-rs-tools # RTT monitor + debug probe for Nordic/ARM bare-metal
 
     # Coding resources:
-    python3
-    gcc
-    poetry
+    python3 # Python interpreter
+    gcc # C/C++ compiler
+    poetry # Python dependency manager
 
     # Code formatters
     nixfmt # Nix formatter
-    stylua
-    black
-    shfmt
-    prettier
-    jq
+    stylua # Lua formatter
+    black # Python formatter
+    shfmt # shell script formatter
+    prettier # web/JS/TS formatter
+    jq # JSON processor
 
     # Small programs:
     rofi # Application launcer
@@ -527,11 +527,11 @@ in {
     mpv # the best video player
     bat # cat but with colors
     bat-extras.core # Batman!
-    ffmpeg-full
+    ffmpeg-full # full-featured media converter
 
     # MAN PAGES:
-    man-pages
-    man-pages-posix
+    man-pages # Linux man pages
+    man-pages-posix # POSIX man pages
 
   ] ++ userprograms.system;
   documentation.dev.enable = true;
