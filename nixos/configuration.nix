@@ -51,6 +51,7 @@ in {
       enableCryptodisk = true;
       device = "nodev";
       configurationLimit = 10;
+      useOSProber = true; # pick up Windows/other installs for dual-boot
     };
     timeout = 1;
   };
@@ -73,10 +74,11 @@ in {
   # the swapfile starts.
   #
   # resume_offset MUST be regenerated whenever the swapfile is (re)created,
-  # e.g. after changing `size` above. Re-read it with:
+  # e.g. after changing `size` above. The installer computes it automatically;
+  # to update it later, set it in personal/profile.conf and rebuild:
   #   sudo filefrag -v /var/lib/swapfile | awk 'NR==4 {print $4+0}'
   boot.resumeDevice = config.fileSystems."/".device;
-  boot.kernelParams = [ "resume_offset=589824" ];
+  boot.kernelParams = [ "resume_offset={{resume_offset}}" ];
 
   # ------------------------------------------------------------------------------------------
   # ----------------------------------------- POWER ----------------------------------------
