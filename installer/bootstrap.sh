@@ -9,6 +9,12 @@ REPO_URL="https://github.com/GerhardMe/GNOMS.git"
 BRANCH="master"
 WORK="/tmp/gnoms"
 
+# ISO default keymap. The chosen layout is written to KEYMAP_FILE so the
+# real installer (cloned below) can use it as the default for its own
+# keyboard_layout question — answered once, used twice.
+DEFAULT_KEYMAP="no"
+KEYMAP_FILE="/tmp/gnoms-keymap"
+
 # -------------------- Colors --------------------
 GREEN="\033[1;32m"
 PURPLE="\033[38;2;135;0;255m"
@@ -31,7 +37,29 @@ cat <<'EOF'
 EOF
 echo -e "${RESET}"
 
-[ "$(id -u)" -eq 0 ] || die "Must run as root. (On the ISO: the 'nixos' user has passwordless sudo — just run: gnoms)"
+# -------------------- Root --------------------
+# The ISO auto-logs in as 'nixos'; re-exec through sudo instead of dying.
+if [ "$(id -u)" -ne 0 ]; then
+	command -v sudo &>/dev/null || die "Must run as root."
+	exec sudo "$0" "$@"
+fi
+
+# -------------------- Keyboard --------------------
+step "Keyboard layout (current default: ${DEFAULT_KEYMAP})"
+while true; do
+	read -r -p "Layout (Enter = ${DEFAULT_KEYMAP}, 'list' for common ones): " km || km=""
+	km="${km:-$DEFAULT_KEYMAP}"
+	if [ "$km" = "list" ]; then
+		echo "Common: no us gb de fr es it se dk fi pl nl pt br cz ru jp"
+		continue
+	fi
+	if loadkeys "$km" 2>/dev/null; then
+		success "Keyboard layout: $km"
+		printf '%s\n' "$km" > "$KEYMAP_FILE"
+		break
+	fi
+	echo -e "${RED}Unknown layout '$km'.${RESET} Try again ('list' shows common layouts)."
+done
 
 step "Checking network…"
 ping -c1 -W3 github.com &>/dev/null ||

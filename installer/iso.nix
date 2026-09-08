@@ -16,13 +16,25 @@
 in {
   imports = [(modulesPath + "/installer/cd-dvd/installation-cd-minimal.nix")];
 
-  # NetworkManager (with nmtui) instead of the ISO's default wpa_supplicant
+  # NetworkManager (with nmtui) + ModemManager instead of the ISO's default
+  # wpa_supplicant. Wired ethernet works out of the box.
   networking.networkmanager.enable = true;
   networking.wireless.enable = lib.mkForce false;
+  networking.modemmanager.enable = true;
+
+  # Auto-login as nixos — the installer (gnoms) starts by itself on tty1.
+  services.getty.autologinUser = "nixos";
+  environment.loginShellInit = ''
+    if [ "$(tty)" = "/dev/tty1" ] && [ -z "''${GNOMS_AUTORUN:-}" ]; then
+      export GNOMS_AUTORUN=1
+      gnoms
+    fi
+  '';
 
   isoImage.volumeID = "GNOMS-INSTALL";
 
-  # Same keyboard as the target system
+  # ISO default keymap; the gnoms script's first prompt offers a change
+  # for the session (Enter keeps this).
   console.keyMap = "no";
 
   environment.systemPackages = with pkgs; [
@@ -32,17 +44,19 @@ in {
     neovim
   ];
 
-  # Greet the user at the login prompt
+  # Greet the user on the other TTYs
   environment.etc."issue".text = ''
 
-    ┌─────────────────────────────────────────────────────┐
-    │                                                     │
-    │            GNOMS  —  INSTALLER  USB                 │
-    │                                                     │
-    │   1. Connect to Wi-Fi:                  nmtui       │
-    │   2. Install (fetches latest GNOMS):    sudo gnoms  │
-    │                                                     │
-    └─────────────────────────────────────────────────────┘
+    ┌────────────────────────────────────────────────────────────┐
+    │                                                            │
+    │             GNOMS  —  INSTALLER  USB                       │
+    │                                                            │
+    │   tty1: auto-logged in, the installer starts by itself.    │
+    │                                                            │
+    │   No network yet?  Exit the installer (Ctrl-C), run        │
+    │   'nmtui' to connect, then run 'gnoms' again.              │
+    │                                                            │
+    └────────────────────────────────────────────────────────────┘
 
   '';
 }

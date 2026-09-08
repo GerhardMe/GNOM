@@ -10,10 +10,20 @@
   locale = "en_GB.UTF-8";
   keyboard_layout = "no";
 
-  # Where the swapfile starts on disk (hibernate). The installer computes this;
-  # if you ever recreate the swapfile, update it (see configuration.nix comment).
-  resume_offset = 589824;
+  # Programs used across GNOMS (exported as env vars in configuration.nix).
+  terminal = "wezterm";
+  editor = "nvim";
+  browser = "firefox";
+
+  # Seconds the GRUB menu waits before booting the default entry.
+  boot_timeout = 1;
 
   github_name = "Gerhard";
   github_email = "gerhard.git@proton.me";
+
+  # Dual-boot: if true, GNOMS installs its GRUB as a contained instance
+  # (/EFI/GNOMS + a separate firmware entry) and never touches the boot order
+  # of an existing OS. If false, GRUB owns the ESP and NVRAM like standard
+  # NixOS. The installer sets this when it detects a dual-boot target.
+  dualboot = false;
 }

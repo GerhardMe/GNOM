@@ -1,4 +1,4 @@
-{ pkgs, config, ... }:
+{ pkgs, config, lib, ... }:
 
 let
   # user/ holds your profile: ./user when running from a synced copy in
@@ -27,9 +27,9 @@ in {
 
   # ENV varriables
   environment.variables = {
-    TERMINAL = "wezterm";
-    EDITOR = "nvim";
-    BROWSER = "firefox";
+    TERMINAL = profile.terminal;
+    EDITOR = profile.editor;
+    BROWSER = profile.browser;
   };
   systemd.user.settings.Manager = {
     ImportEnvironment = "DISPLAY XAUTHORITY";
@@ -53,16 +53,38 @@ in {
 
   boot.loader.systemd-boot.enable = false;
   boot.loader = {
-    efi.canTouchEfiVariables = true;
+    # dualboot = false: GRUB owns the ESP and NVRAM like standard NixOS.
+    # dualboot = true:  contained instance — GRUB installs into /EFI/GNOMS
+    #                   (via efiBootloaderId below) with --no-nvram, and
+    #                   extraInstallCommands registers a separate firmware
+    #                   entry without touching the existing OS's boot order.
+    efi.canTouchEfiVariables = !profile.dualboot;
     grub = {
       enable = true;
       efiSupport = true;
       enableCryptodisk = true;
       device = "nodev";
       configurationLimit = 5;
-      useOSProber = true; # pick up Windows/other installs for dual-boot
+      useOSProber = profile.dualboot;
+      extraInstallCommands = lib.optionalString profile.dualboot ''
+        # Contained instance: grub-install above ran with --no-nvram, leaving
+        # NixOS's GRUB at /EFI/<distro>-boot on the ESP. Copy it under a stable
+        # path and register a "GNOMS" firmware entry --create-only (never
+        # reorders the boot menu). Idempotent: guarded by a fixed-string match
+        # on the loader path in `efibootmgr -v`.
+        mkdir -p /boot/EFI/GNOMS
+        cp -f /boot/EFI/${config.system.nixos.distroName}-boot/grubx64.efi /boot/EFI/GNOMS/grubx64.efi
+        esp_dev="$(${pkgs.util-linux}/bin/findmnt -n -o SOURCE /boot)"
+        esp_part="$(cat "/sys/class/block/$(basename "$esp_dev")/partition")"
+        esp_disk="$(${pkgs.util-linux}/bin/lsblk -no PKNAME "$esp_dev")"
+        if ! ${pkgs.efibootmgr}/bin/efibootmgr -v | grep -qF '\EFI\GNOMS'; then
+          ${pkgs.efibootmgr}/bin/efibootmgr --create-only --quiet \
+            --label GNOMS --disk "/dev/$esp_disk" --part "$esp_part" \
+            --loader '\EFI\GNOMS\grubx64.efi'
+        fi
+      '';
     };
-    timeout = 1;
+    timeout = profile.boot_timeout;
   };
   boot.blacklistedKernelModules =
     [ "nouveau" "nvidiafb" ]; # to get eGPU to work
@@ -79,15 +101,13 @@ in {
   # --- Hibernate / resume ---
   # The swapfile lives on the LUKS-encrypted ext4 root, so any hibernation
   # image is encrypted at rest. initrd already unlocks that device for root;
-  # resumeDevice points the kernel at it, and resume_offset says where in it
-  # the swapfile starts.
-  #
-  # resume_offset MUST be regenerated whenever the swapfile is (re)created,
-  # e.g. after changing `size` above. The installer computes it automatically;
-  # to update it later, set it in user/userprofile.nix and rebuild:
+  # resumeDevice points the kernel at it. resume_offset is machine-generated
+  # (where the swapfile physically lands on disk — never a user setting);
+  # it must be updated whenever the swapfile is (re)created:
   #   sudo filefrag -v /var/lib/swapfile | awk 'NR==4 {print $4+0}'
+  # Phase 3 will move this value into the installer-generated config.
   boot.resumeDevice = config.fileSystems."/".device;
-  boot.kernelParams = [ "resume_offset=${toString profile.resume_offset}" ];
+  boot.kernelParams = [ "resume_offset=589824" ];
 
   # ------------------------------------------------------------------------------------------
   # ----------------------------------------- POWER ----------------------------------------

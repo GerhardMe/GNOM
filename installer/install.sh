@@ -1,346 +1,354 @@
 #!/usr/bin/env bash
-# install.sh — the real GNOMS installer.
-# Never run from the USB copy: bootstrap.sh clones GNOMS to /tmp/gnoms and
-# runs THIS script from that fresh clone, so installer logic always matches
-# the config it installs. Pulls GNOMS from master.
+# install.sh — the GNOMS installer. Lives in the repo (fetched at install
+# time by bootstrap.sh), so it can grow without the ISO going stale.
 #
-# Flow: preflight → manual partitioning (guided prompts) → optional LUKS →
-# mount → 32 GB swapfile + resume_offset → clone GNOMS to target →
-# generate hardware-configuration.nix → template flake into /mnt/etc/nixos →
-# nixos-install.
+# Usage: install.sh [repo-root]    (bootstrap.sh passes the clone path)
+#
+# Implements: Phase 1 — partitioning + LUKS2 + swapfile/resume_offset.
+# Phases 3-6 (baseline install, repo pull, profile/programs questions,
+# handoff) slot in at the marked TODOs.
+#
+# VM testing: set GNOMS_STOP_AFTER_PARTITION=1 to stop once the disk is
+# prepared and mounted, so the result can be inspected before continuing.
+
 set -euo pipefail
 
-# -------------------- Paths / constants --------------------
-SOURCE_REPO="${1:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}"
-REPO_URL="https://github.com/GerhardMe/GNOMS.git"
-BRANCH="master"
+REPO="${1:-}"
+FACTS="/tmp/gnoms-facts"
+KEYMAP_FILE="/tmp/gnoms-keymap"
 MNT="/mnt"
-ETC_NIXOS="$MNT/etc/nixos"
-PROFILE="$SOURCE_REPO/personal/profile.conf"
-MAPPER="cryptroot"
-SWAP_SIZE_MIB=$((32 * 1024)) # 32 GiB — MUST match swapDevices size in nixos/configuration.nix
 
-# -------------------- Colors --------------------
+ESP_GUID="c12a7328-f81f-11d2-ba4b-00a0c93ec93b"
+ESP_DEFAULT_MB=1024
+MIN_ROOT_MB=20480   # warn if root gets under 20 GiB
+SWAP_MIN_MB=1024
+
+# -------------------- Colors / output --------------------
 GREEN="\033[1;32m"
 PURPLE="\033[38;2;135;0;255m"
 RED="\033[1;31m"
 YELLOW="\033[1;33m"
 RESET="\033[0m"
 
-step() { echo -e "${PURPLE}[  ▶▶  ]${RESET} $1"; }
+step()    { echo -e "${PURPLE}[  ▶▶  ]${RESET} $1"; }
 success() { echo -e "${GREEN}[  OK  ]${RESET} $1"; }
-warn() { echo -e "${YELLOW}[  ⚠   ]${RESET} $1"; }
-error() { echo -e "${RED}[  !!  ]${RESET} $1" >&2; }
-die() { error "$1"; exit 1; }
+warn()    { echo -e "${YELLOW}[ WARN ]${RESET} $1"; }
+die()     { echo -e "${RED}[  !!  ]${RESET} $1" >&2; exit 1; }
 
-trap 'error "Installation failed. /mnt is left mounted so you can inspect the damage."; exit 1' ERR
+ask()      { local v; read -r -p "$1" v; echo "$v"; }
+ask_def()  { local v; read -r -p "$1 [$2]: " v; echo "${v:-$2}"; }
+confirm()  { local a; read -r -p "$1 [y/N]: " a; [[ "$a" =~ ^[Yy] ]]; }
 
-# -------------------- Profile parser (same logic as reconfigure.sh) --------------------
-declare -A CONFIG
-
-parse_config() {
-	local in_block=""
-	local block_content=""
-
-	while IFS= read -r line || [[ -n "$line" ]]; do
-		[[ "$line" =~ ^[[:space:]]*# ]] && continue
-		[[ -z "${line// /}" ]] && continue
-
-		if [[ -n "$in_block" ]] && [[ "$line" =~ ^[[:space:]]*\}[[:space:]]*$ ]]; then
-			CONFIG["$in_block"]="$block_content"
-			in_block=""
-			continue
-		fi
-
-		if [[ -n "$in_block" ]]; then
-			local trimmed="${line#"${line%%[![:space:]]*}"}"
-			block_content+="${trimmed}"$'\n'
-			continue
-		fi
-
-		if [[ "$line" =~ ^([a-z_]+)[[:space:]]*=[[:space:]]*\{[[:space:]]*$ ]]; then
-			in_block="${BASH_REMATCH[1]}"
-			block_content=""
-			continue
-		fi
-
-		if [[ "$line" =~ ^([a-z_]+)[[:space:]]*=[[:space:]]*(.+)$ ]]; then
-			local value="${BASH_REMATCH[2]}"
-			[[ "$value" == "{" ]] && continue
-			CONFIG["${BASH_REMATCH[1]}"]="$value"
-		fi
-	done <"$PROFILE"
+# -------------------- Facts (machine-generated, for later phases) ----------
+# KEY=VALUE lines. Phase 4 turns these into userprofile/configuration bits.
+# resume_offset and dualboot must never be hand-written into userprofile.
+fact_set() {	# fact_set KEY VALUE
+	grep -v "^$1=" "$FACTS" 2>/dev/null > "$FACTS.tmp" || true
+	mv "$FACTS.tmp" "$FACTS"
+	printf '%s=%s\n' "$1" "$2" >> "$FACTS"
+}
+fact_get() {	# fact_get KEY  -> prints value or empty
+	grep "^$1=" "$FACTS" 2>/dev/null | tail -1 | cut -d= -f2-
 }
 
-# set_key <key> <value> — update or append a key in profile.conf
-set_key() {
-	local key="$1" value="$2"
-	if grep -qE "^${key}[[:space:]]*=" "$PROFILE"; then
-		sed -i "s|^${key}[[:space:]]*=.*|${key} = ${value}|" "$PROFILE"
-	else
-		printf '\n%s = %s\n' "$key" "$value" >>"$PROFILE"
+# -------------------- Environment checks --------------------
+assert_root()   { [ "$(id -u)" -eq 0 ] || die "Must run as root."; }
+assert_uefi() {
+	[ -d /sys/firmware/efi ] ||
+		die "Not booted in UEFI mode. GNOMS requires UEFI (GRUB is efi-only here)."
+}
+
+# The disk the installer itself boots from must never be a wipe target.
+install_medium_disk() {
+	local src disk=""
+	src=$(findmnt -n -o SOURCE /iso 2>/dev/null || true)
+	if [ -n "$src" ]; then
+		disk=$(lsblk -no PKNAME "$src" 2>/dev/null || true)
 	fi
+	echo "/dev/${disk:-none}"
 }
 
-# apply_template <input> <output> — replace all {{key}} patterns (same logic as reconfigure.sh)
-apply_template() {
-	local input="$1"
-	local output="$2"
+# -------------------- Disk helpers --------------------
+# One line per disk:  /dev/X|SIZE_MB|MODEL|NOTES   (lsblk -P parsed via -F'"')
+list_disks() {
+	local med; med=$(install_medium_disk)
+	lsblk -dnb -o NAME,SIZE,TYPE,RM,MODEL |
+	awk -F'"' -v med="$med" '$6=="disk" {
+		dev="/dev/"$2; notes="";
+		if ($8=="1") notes="removable ";
+		if (dev==med) notes=notes "[INSTALL MEDIUM]";
+		printf "%s|%d|%s|%s\n", dev, int($4/1048576), $10, notes
+	}'
+}
 
-	cp "$input" "$output"
+disk_free_bytes() {	# largest free gap on a disk, in bytes (0 if none)
+	parted -ms "$1" unit B print free 2>/dev/null |
+	awk -F'[;:]' '$5=="free" { if ($4 > best) best = $4 } END { print best+0 }'
+}
 
-	for key in "${!CONFIG[@]}"; do
-		local value="${CONFIG[$key]}"
-		value="${value//\\/\\\\}"
-		value="${value//&/\\&}"
-		value="${value//$'\n'/\\n}"
-		sed -i "s|{{${key}}}|${value}|g" "$output"
+partitions_of() {	# NAME|SIZE|FSTYPE lines for a disk
+	lsblk -nr -o NAME,TYPE,SIZE,FSTYPE "$1" |
+	awk '$2=="part" { printf "/dev/%s|%s|%s\n", $1, $3, ($4==""?"-":$4) }'
+}
+
+# ESP partitions of a disk (GPT type c12a7328-…)
+esp_on_disk() {
+	local p
+	for p in $(lsblk -nr -o NAME,TYPE "$1" | awk '$2=="part"{print "/dev/"$1}'); do
+		[ "$(lsblk -no PARTTYPE "$p" 2>/dev/null | tr 'A-Z' 'a-z')" = "$ESP_GUID" ] && echo "$p"
 	done
+	return 0
 }
 
-# -------------------- Prompts --------------------
-ask() { # ask <prompt> <default> — echoes answer
-	local prompt="$1" default="${2-}" answer
-	read -rp "$(echo -e "${PURPLE}?${RESET} ${prompt} [$default]: ")" answer
-	echo "${answer:-$default}"
+# Create a partition in the largest free gap. 4th arg: size in MB
+# (empty = rest of the gap). Prints the created device path.
+create_part_in_free_space() {
+	local disk="$1" code="$2" label="$3" size_mb="${4:-}" num opt
+	num=$(parted -ms "$disk" unit B print free |
+		awk -F'[;:]' '$1 ~ /^[0-9]+$/ { if ($1 > n) n = $1 } END { print n+1 }')
+	[ -n "$num" ] || num=1
+	if [ -n "$size_mb" ]; then opt="+${size_mb}M"; else opt="0"; fi
+	sgdisk -n${num}:0:${opt} -t${num}:${code} -c${num}:${label} "$disk"
+	partprobe "$disk"
+	udevadm settle
+	lsblk -nr -o NAME,TYPE "$disk" | awk -v n="$num" '$2=="part" && $1 ~ n"$" { print "/dev/"$1; exit }'
 }
 
-ask_yn() { # ask_yn <prompt> <default y|N>
-	local prompt="$1" default="${2:-N}" answer
-	read -rp "$(echo -e "${PURPLE}?${RESET} ${prompt} $( [ "$default" = y ] && echo '[Y/n]' || echo '[y/N]' )"): " answer
-	answer="${answer:-$default}"
-	[[ "$answer" =~ ^[Yy] ]]
-}
-
-validate_blockdev() {
-	[[ -b "$1" ]] || die "'$1' is not a block device. (Check with lsblk)"
-}
-
-banner() {
-	echo -e "${PURPLE}"
-	cat <<'EOF'
-   ██████╗ ███╗   ██╗ ██████╗ ███╗   ███╗ ███████╗
-  ██╔════╝ ████╗  ██║██╔═══██╗████╗ ████║ ██╔════╝
-  ██║  ███╗██╔██╗ ██║██║   ██║██╔████╔██║ ███████╗
-  ██║   ██║██║╚██╗██║██║   ██║██║╚██╔╝██║ ╚════██║
-  ╚██████╔╝██║ ╚████║╚██████╔╝██║ ╚═╝ ██║ ███████║
-   ╚═════╝ ╚═╝  ╚═══╝ ╚═════╝ ╚═╝     ╚═╝ ╚══════╝
-                     — installer —
-EOF
-	echo -e "${RESET}"
-}
-
-# ============================== 1. Preflight ==============================
-preflight() {
-	banner
-
-	[ "$(id -u)" -eq 0 ] || die "Must run as root."
-	command -v nixos-install &>/dev/null || die "This does not look like a NixOS installer environment."
-	ping -c1 -W3 github.com &>/dev/null || die "No network. Run 'nmtui' to connect to Wi-Fi, then retry."
-
-	parse_config
-
-	step "Defaults from profile.conf:"
-	echo -e "    hostname : ${CONFIG[hostname]}"
-	echo -e "    username : ${CONFIG[username]}"
-	echo -e "    timezone : ${CONFIG[timezone]}"
-	echo -e "    locale   : ${CONFIG[locale]}"
-
-	step "Current disks:"
-	lsblk -e 7 -o NAME,SIZE,TYPE,FSTYPE,MOUNTPOINTS
-
-	warn "This will DESTROY all data on the partition you choose as root."
-	warn "Dual-boot: partition manually in another TTY (alt+F2) BEFORE continuing —"
-	warn "the installer never touches the EFI partition, so Windows/other entries survive."
-	ask_yn "Ready to continue?" || die "Aborted."
-}
-
-# ============================== 2. Partitioning guidance ==============================
-partition_guidance() {
-	step "Manual partitioning cheat-sheet (run in another TTY if you like):"
-	cat <<'EOF'
-
-    gdisk /dev/nvme0n1          # or fdisk / parted / cfdisk
-
-    Fresh disk:
-      1) EFI partition : 512M, type ef00  → mkfs.fat -F32 /dev/nvme0n1p1
-      2) Root partition: rest, type 8304 (or 8309 for LUKS)
-
-    Dual-boot (Windows already installed):
-      1) Shrink the Windows partition (from Windows Disk Management, or ntfsresize)
-      2) Create root partition: rest, type 8304
-      3) Reuse the existing EFI partition — do NOT format it
-
-    The root partition may be small (60G+ recommended); 32G of it is swap.
-EOF
-	ask_yn "Partitioning is done?" || die "Aborted. Partition now, then run again."
-}
-
-# ============================== 3. Questions ==============================
-questions() {
-	step "Questions — Enter accepts the default."
-
-	ROOT_PART=$(ask "Root partition (e.g. /dev/nvme0n1p5)" "")
-	validate_blockdev "$ROOT_PART"
-
-	ESP_PART=$(ask "EFI System Partition (e.g. /dev/nvme0n1p1)" "")
-	validate_blockdev "$ESP_PART"
-	[[ "$ESP_PART" != "$ROOT_PART" ]] || die "ESP and root must be different partitions."
-	[[ -n "$(lsblk -no FSTYPE "$ESP_PART")" ]] ||
-		warn "ESP has no filesystem — format it with 'mkfs.fat -F32 $ESP_PART' first."
-
-	if ask_yn "Wipe and reformat the root partition? (N only if re-running on an already prepared root)"; then
-		FORMAT_ROOT=y
-	else
-		FORMAT_ROOT=n
-	fi
-
-	if ask_yn "Encrypt the root partition with LUKS?"; then
-		ENCRYPT=y
-	else
-		ENCRYPT=n
-	fi
-
-	if [ "$FORMAT_ROOT" = y ] && [ "$ENCRYPT" = n ]; then
-		warn "ROOT DATA ON $ROOT_PART WILL BE ERASED."
-		ask_yn "Last chance — really format $ROOT_PART?" || die "Aborted."
-	fi
-
-	USERNAME=$(ask "Username" "${CONFIG[username]}")
-	HOSTNAME=$(ask "Hostname" "${CONFIG[hostname]}")
-	TIMEZONE=$(ask "Timezone" "${CONFIG[timezone]}")
-	LOCALE=$(ask "Locale" "${CONFIG[locale]}")
-
-	[ "$FORMAT_ROOT" = y ] && [ "$ENCRYPT" = y ] && {
-		warn "$ROOT_PART WILL BE LUKS-FORMATTED — ALL DATA ERASED."
-		ask_yn "Final check — really encrypt and format $ROOT_PART?" || die "Aborted."
-	}
-}
-
-# ============================== 4. Mount ==============================
-do_mount() {
-	step "Unlocking / formatting root…"
-
-	if [ "$ENCRYPT" = y ]; then
-		if [ -e "/dev/mapper/$MAPPER" ]; then
-			step "/dev/mapper/$MAPPER already open — reusing (re-run detected)."
-		else
-			if [ "$FORMAT_ROOT" = y ]; then
-				cryptsetup luksFormat --type luks2 "$ROOT_PART"
-			fi
-			cryptsetup open "$ROOT_PART" "$MAPPER"
+# -------------------- Host OS detection --------------------
+# Mount every vfat partition read-only and look at /EFI/* to see what else
+# lives on this machine. Result drives mode defaults and the dualboot fact.
+detect_host_oses() {
+	local found="" p mp d os
+	for p in $(lsblk -nr -o NAME,TYPE,FSTYPE | awk '$2=="part" && $3=="vfat"{print "/dev/"$1}'); do
+		mp=$(mktemp -d /tmp/gnoms-esp.XXXXXX)
+		if mount -o ro "$p" "$mp" 2>/dev/null; then
+			for d in "$mp"/EFI/*; do
+				[ -d "$d" ] || continue
+				os=$(basename "$d")
+				case "$os" in
+					Microsoft) os="Windows" ;;
+					Boot) continue ;;
+				esac
+				found="$found $os"
+			done
+			umount "$mp"
 		fi
-		ROOT_DEV="/dev/mapper/$MAPPER"
-	else
-		ROOT_DEV="$ROOT_PART"
-		[ "$FORMAT_ROOT" = y ] && mkfs.ext4 -F "$ROOT_DEV"
-	fi
+		rmdir "$mp" 2>/dev/null || true
+	done
+	echo "$found" | tr ' ' '\n' | awk 'NF' | sort -u | tr '\n' ' '
+}
 
-	mkdir -p "$MNT"
-	mount "$ROOT_DEV" "$MNT"
-	step "Mounting ESP at $MNT/boot (never formatted)…"
+# -------------------- Shared prep pieces --------------------
+
+mapper_of() {	# luks mapper name convention must match nixos-generate-config
+	echo "/dev/mapper/luks-$(blkid -s UUID -o value "$1")"
+}
+
+format_luks_root() {	# format_luks_root PART — prompts for passphrase
+	local part="$1" pass pass2 uuid
+	while true; do
+		read -r -s -p "  LUKS passphrase for root (unlocks the disk on every boot): " pass; echo
+		read -r -s -p "  Repeat: " pass2; echo
+		[ -n "$pass" ] && [ "$pass" = "$pass2" ] && break
+		warn "Passphrases empty or don't match — try again."
+	done
+	step "Formatting $part as LUKS2 (argon2id)…"
+	printf '%s' "$pass" | cryptsetup luksFormat --type luks2 --pbkdf argon2id --batch-mode "$part" -
+	uuid=$(blkid -s UUID -o value "$part")
+	printf '%s' "$pass" | cryptsetup open "$part" "luks-$uuid" --key-file=-
+	step "Creating ext4 root filesystem…"
+	mkfs.ext4 -F -L nixos "/dev/mapper/luks-$uuid"
+	fact_set luks_uuid "$uuid"
+}
+
+mount_system() {	# mount_system MAPPER ESP_PART — root first, then ESP
+	local mapper="$1" esp="$2"
+	step "Mounting root at $MNT, ESP at $MNT/boot…"
+	mount "$mapper" "$MNT"
 	mkdir -p "$MNT/boot"
-	mount "$ESP_PART" "$MNT/boot"
-	success "Root and ESP mounted."
+	mount "$esp" "$MNT/boot"
+	fact_set root_fs_uuid "$(blkid -s UUID -o value "$mapper")"
 }
 
-# ============================== 5. Swap ==============================
-do_swap() {
-	step "Creating ${SWAP_SIZE_MIB}M swapfile (matches configuration.nix) — this takes a minute…"
-	mkdir -p "$MNT/var/lib"
-	rm -f "$MNT/var/lib/swapfile"
-	dd if=/dev/zero of="$MNT/var/lib/swapfile" bs=1M count="$SWAP_SIZE_MIB" status=progress
-	chmod 600 "$MNT/var/lib/swapfile"
-	mkswap "$MNT/var/lib/swapfile"
-
-	RESUME_OFFSET=$(filefrag -v "$MNT/var/lib/swapfile" | awk 'NR==4 {print $4+0}')
-	[ -n "$RESUME_OFFSET" ] && [ "$RESUME_OFFSET" != 0 ] ||
-		die "Could not determine resume_offset (got '$RESUME_OFFSET')."
-	success "Swapfile created. resume_offset = $RESUME_OFFSET"
-}
-
-# ============================== 6. Repo + hardware config ==============================
-do_repo() {
-	step "Cloning GNOMS (${BRANCH}) into target…"
-	TARGET_REPO="$MNT/home/$USERNAME/GNOMS"
-	rm -rf "$TARGET_REPO"
-	git clone --branch "$BRANCH" "$REPO_URL" "$TARGET_REPO" ||
-		die "Failed to clone $REPO_URL into target."
-	success "GNOMS cloned → $TARGET_REPO"
-
-	step "Generating hardware-configuration.nix from the target…"
-	nixos-generate-config --root "$MNT"
-	[ -f "$MNT/etc/nixos/hardware-configuration.nix" ] ||
-		die "nixos-generate-config did not produce hardware-configuration.nix."
-
-	step "Installing generated hardware config into the repo clone…"
-	cp "$MNT/etc/nixos/hardware-configuration.nix" "$TARGET_REPO/nixos/hardware-configuration.nix"
-
-	# Keep only what the repo needs; remove the rest of the generated boilerplate.
-	# (hardware-configuration.nix stays in $ETC_NIXOS — configuration.nix imports it.)
-	rm -f "$MNT/etc/nixos/configuration.nix" "$MNT/etc/nixos/flake.nix"
-
-	step "Writing install answers into the clone's profile.conf…"
-	PROFILE="$TARGET_REPO/personal/profile.conf"
-	set_key hostname "$HOSTNAME"
-	set_key username "$USERNAME"
-	set_key timezone "$TIMEZONE"
-	set_key locale "$LOCALE"
-	set_key resume_offset "$RESUME_OFFSET"
-	parse_config
-	success "profile.conf updated."
-}
-
-# ============================== 7. Template into /mnt/etc/nixos ==============================
-do_template() {
-	step "Templating flake files into $ETC_NIXOS…"
-	mkdir -p "$ETC_NIXOS"
-	for file in flake.nix configuration.nix home.nix; do
-		apply_template "$SOURCE_REPO/nixos/$file" "$ETC_NIXOS/$file"
+make_swap() {	# make_swap MNT — swapfile lives on the encrypted root
+	local mnt="$1" ram_mb size_mb offset
+	ram_mb=$(awk '/MemTotal/ { printf "%d", $2/1024 }' /proc/meminfo)
+	while true; do
+		size_mb=$(ask_def "  Swapfile size in MB (must be ≥ RAM for hibernation)" "$ram_mb")
+		[[ "$size_mb" =~ ^[0-9]+$ ]] && [ "$size_mb" -ge "$SWAP_MIN_MB" ] && break
+		warn "Enter a number ≥ ${SWAP_MIN_MB}."
 	done
-	cp -f "$SOURCE_REPO/nixos/flake.lock" "$ETC_NIXOS/flake.lock"
-	success "Flake files templated and in place."
+	step "Creating /var/lib/swapfile (${size_mb} MB) on the new root…"
+	mkdir -p "$mnt/var/lib"
+	dd if=/dev/zero of="$mnt/var/lib/swapfile" bs=1M count="$size_mb" status=none
+	chmod 600 "$mnt/var/lib/swapfile"
+	mkswap -L swap "$mnt/var/lib/swapfile"
+	offset=$(filefrag -v "$mnt/var/lib/swapfile" | awk 'NR==4 { print $4+0 }')
+	fact_set swapfile_size_mb "$size_mb"
+	fact_set resume_offset "$offset"
+	success "Swapfile ready; resume_offset=$offset"
+	# Phase 4 note: configuration.nix's swapDevices must drop its `size` key
+	# so NixOS never recreates/resizes the file (that would move the offset).
 }
 
-# ============================== 8. Install ==============================
-do_install() {
-	step "Running nixos-install (grab a coffee)…"
-	nixos-install --flake "$ETC_NIXOS#$HOSTNAME"
+# -------------------- Partitioning modes --------------------
 
-	step "Setting user password…"
-	nixos-enter --root "$MNT" -c "passwd $USERNAME"
+prep_whole_disk() {	# GNOMS erases a whole drive and owns it
+	local disk confirm esp_mb
+	while true; do
+		echo "  Available disks:"
+		list_disks | awk -F'|' '{ printf "    %-14s %7d MB  %s %s\n", $1, $2, $4, $3 }'
+		disk=$(ask_def "  Disk to erase entirely" "")
+		[ -b "$disk" ] || { warn "No such block device: $disk"; continue; }
+		break
+	done
+	[ "$disk" = "$(install_medium_disk)" ] &&
+		die "$disk is the install medium itself. Pick another disk."
 
-	step "Fixing ownership of the repo clone…"
-	nixos-enter --root "$MNT" -c "chown -R $USERNAME:users /home/$USERNAME/GNOMS"
+	echo "  Current contents of $disk:"
+	partitions_of "$disk" | awk -F'|' '{ printf "    %-14s %8s  %s\n", $1, $2, $3 }'
+	confirm=$(ask "  ERASE EVERYTHING on $disk — type the full device name to confirm")
+	[ "$confirm" = "$disk" ] || die "Aborted."
 
-	success "GNOMS installed!"
-	cat <<EOF
+	esp_mb=$(ask_def "  EFI System Partition size (MB)" "$ESP_DEFAULT_MB")
+	step "Wiping partition table and creating ESP + encrypted root on $disk…"
+	sgdisk --zap-all "$disk"
+	partprobe "$disk"
+	sgdisk -n1:0:+${esp_mb}M -t1:ef00 -c1:GNOMS-ESP "$disk"
+	sgdisk -n2:0:0 -t2:8309 -c2:GNOMS-ROOT "$disk"
+	partprobe "$disk"
+	udevadm settle
+	local part_esp part_root
+	part_esp=$(esp_on_disk "$disk" | head -1)
+	part_root=$(partitions_of "$disk" | tail -1 | cut -d'|' -f1)
+	mkfs.vfat -F32 -n GNOMS-BOOT "$part_esp"
+	fact_set mode whole-disk
+	fact_set dualboot false
+	fact_set esp_part "$part_esp"
+	fact_set esp_is_new true
+	format_luks_root "$part_root"
+	mount_system "$(mapper_of "$part_root")" "$part_esp"
+}
 
-  ${GREEN}All done.${RESET}
+prep_free_space() {	# dual boot into unpartitioned space; host OS untouched
+	local disk free_mb part_root esp
+	while true; do
+		echo "  Disks:"
+		list_disks | awk -F'|' '{ printf "    %-14s %7d MB  %s %s\n", $1, $2, $4, $3 }'
+		disk=$(ask_def "  Disk to install into (only free space is used)" "")
+		[ -b "$disk" ] || { warn "No such block device: $disk"; continue; }
+		break
+	done
+	[ "$disk" = "$(install_medium_disk)" ] &&
+		die "$disk is the install medium itself."
 
-    - Remove the USB stick and reboot:   reboot
-    - Log in as $USERNAME (password set above).
-    - The flake lives in /etc/nixos, the repo in ~/GNOMS.
-    - Manage the system with:            reconfigure rebuild
-    - Windows/other OSes appear in the GRUB menu (os-prober).
-    - Hibernation uses the swapfile with resume_offset=$RESUME_OFFSET (already configured).
+	free_mb=$(( $(disk_free_bytes "$disk") / 1048576 ))
+	[ "$free_mb" -ge "$MIN_ROOT_MB" ] ||
+		die "Only ${free_mb} MB unpartitioned on $disk (need ≥ ${MIN_ROOT_MB} MB). Shrink the host OS first, then re-run."
+	[ "$free_mb" -lt $((MIN_ROOT_MB * 2)) ] &&
+		warn "Only ${free_mb} MB free — tight for NixOS + programs."
 
-  ${YELLOW}NOTE:${RESET} the root password is whatever you set during nixos-install.
-EOF
-
-	if ask_yn "Reboot now?"; then
-		umount -R "$MNT" || true
-		cryptsetup close "$MAPPER" 2>/dev/null || true
-		reboot
+	fact_set mode dualboot
+	fact_set dualboot true
+	if [ -z "$(esp_on_disk "$disk")" ]; then
+		warn "No EFI System Partition on $disk — creating one from its free space."
+		esp=$(create_part_in_free_space "$disk" ef00 GNOMS-ESP "$ESP_DEFAULT_MB")
+		mkfs.vfat -F32 -n GNOMS-BOOT "$esp"
+		fact_set esp_is_new true
+	else
+		esp=$(esp_on_disk "$disk" | head -1)
+		fact_set esp_is_new false
 	fi
+	fact_set esp_part "$esp"
+	part_root=$(create_part_in_free_space "$disk" 8309 GNOMS-ROOT)
+	format_luks_root "$part_root"
+	mount_system "$(mapper_of "$part_root")" "$esp"
 }
 
-# ============================== Main ==============================
-preflight
-partition_guidance
-questions
-do_mount
-do_swap
-do_repo
-do_template
-do_install
+prep_existing_partition() {	# advanced: reformat a chosen partition as root
+	local disk part n i parts confirm esp
+	while true; do
+		echo "  Disks:"
+		list_disks | awk -F'|' '{ printf "    %-14s %7d MB  %s %s\n", $1, $2, $4, $3 }'
+		disk=$(ask_def "  Disk holding the partition to use" "")
+		[ -b "$disk" ] || { warn "No such block device: $disk"; continue; }
+		break
+	done
+	esp=$(esp_on_disk "$disk" | head -1)
+	[ -n "$esp" ] || die "No ESP on $disk. Dual-boot needs one (GNOMS's GRUB joins it)."
+
+	echo "  Partitions on $disk:"
+	i=0; parts=()
+	while IFS='|' read -r p sz fs; do parts+=("$p"); i=$((i+1)); echo "    $i) $p  $sz  $fs"; done < <(partitions_of "$disk")
+	n=$(ask_def "  Partition to reformat as encrypted GNOMS root (number)" "")
+	[[ "$n" =~ ^[0-9]+$ ]] && [ "$n" -ge 1 ] && [ "$n" -le "${#parts[@]}" ] || die "Bad choice."
+	part="${parts[$((n-1))]}"
+
+	confirm=$(ask "  ERASE $part (LUKS2/ext4 over it) — type its full path to confirm")
+	[ "$confirm" = "$part" ] || die "Aborted."
+
+	fact_set mode partition
+	fact_set dualboot true
+	fact_set esp_part "$esp"
+	fact_set esp_is_new false
+	format_luks_root "$part"
+	mount_system "$(mapper_of "$part")" "$esp"
+}
+
+# -------------------- Main --------------------
+
+assert_root
+assert_uefi
+
+echo -e "${PURPLE}  ── GNOMS installer — disk setup ──${RESET}"
+
+# Keyboard may have been set by bootstrap.sh on the ISO; apply as default.
+if [ -r "$KEYMAP_FILE" ]; then
+	km=$(cat "$KEYMAP_FILE")
+	if loadkeys "$km" 2>/dev/null; then
+		success "Keyboard layout: $km"
+		fact_set keyboard_layout "$km"
+	fi
+fi
+
+step "Scanning for existing operating systems…"
+HOST_OSES=$(detect_host_oses)
+if [ -n "$HOST_OSES" ]; then
+	echo "  Found: ${HOST_OSES}"
+else
+	echo "  None found on any EFI partition."
+fi
+
+echo
+echo "  How should GNOMS be installed?"
+echo "    1) Whole disk   — GNOMS erases an entire drive and owns it"
+echo "    2) Dual boot    — GNOMS takes unpartitioned free space, sharing the ESP"
+echo "    3) Advanced     — pick an existing partition to reformat (dual boot)"
+mode=$(ask_def "  Choice" "$([ -n "$HOST_OSES" ] && echo 2 || echo 1)")
+
+case "$mode" in
+	1) prep_whole_disk ;;
+	2) prep_free_space ;;
+	3) prep_existing_partition ;;
+	*) die "Bad choice." ;;
+esac
+
+make_swap "$MNT"
+
+echo
+success "Disk prepared:"
+echo "    $(fact_get mode) | root: $(fact_get root_fs_uuid) | LUKS: $(fact_get luks_uuid)"
+echo "    ESP: $(fact_get esp_part) (new: $(fact_get esp_is_new)) | dualboot: $(fact_get dualboot)"
+echo "    swap: $(fact_get swapfile_size_mb) MB at offset $(fact_get resume_offset)"
+
+if [ "${GNOMS_STOP_AFTER_PARTITION:-0}" = "1" ]; then
+	success "GNOMS_STOP_AFTER_PARTITION set — stopping here for inspection."
+	exit 0
+fi
+
+# TODO Phase 3: baseline NixOS install (nixos-install with generated config),
+#               repo pull onto the target, repo-URL derivation.
+# TODO Phase 4: profile questions → generate user/userprofile.nix.
+# TODO Phase 5: programs question → generate user/userprograms.nix.
+# TODO Phase 6: handoff message + kick off full build/switch.
+die "Disk setup complete, but install steps (Phase 3+) are not implemented yet."
