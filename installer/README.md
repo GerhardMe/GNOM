@@ -15,9 +15,11 @@ disk you care about.
   the repo and runs the installer *from the clone*. The USB never goes
   stale: fix the installer in the repo, and every existing stick picks it
   up on the next run.
-- **Any fork works.** Nothing here is tied to the original repo. The ISO
-  bakes in the URL of whatever checkout built it, the installer derives its
-  questions from the repo it cloned, and it nudges you to fork.
+- **Any fork works, and no install is tied to upstream.** The ISO bakes in
+  the URL of whatever checkout built it and the installer derives its
+  questions from the repo it cloned. The copy it leaves on the new machine
+  has no `.git` at all: it is yours to `git init` and push wherever you
+  like (the handoff message shows how).
 - **Encryption is not optional.** The root is always LUKS2 with argon2id.
   What is optional is how much of the disk GNOMS owns.
 - **The target ends up with bare NixOS + GNOMS, nothing else.**
@@ -116,11 +118,9 @@ Set `GNOMS_STOP_AFTER_PARTITION=1` to stop right here, mounted, for a look.
   them, or none of them (faster install, add programs later). No
   individual picking. The core system from `configuration.nix` and
   `home.nix` installs either way.
-- *Your fork* — optional URL of your own fork. If given, `~/GNOMS` on the
-  new machine points at it from the start.
 
-**3. Unattended.** An intro text explains what follows and why you should
-fork. Then:
+**3. Unattended.** An intro text explains what follows and that the copy
+in your home will be yours to put in a repo. Then:
 
 1. `nixos-generate-config` writes `/etc/nixos/hardware-configuration.nix`
    on the target. That is the one per-machine file. It never goes in the
@@ -132,20 +132,22 @@ fork. Then:
    installer copies it to `/EFI/GNOMS/grubx64.efi` and adds a "GNOMS"
    firmware entry with `--create-only`. The other OS's boot order is never
    changed; GNOMS shows up next to it in the firmware boot menu.
-4. The clone the installer runs from is **copied** to `~/GNOMS` on the
-   target (same commit the questions came from, no second download) and
-   your answers are written into it: the profile values are replaced in
-   place in `user/userprofile.nix` (comments and custom keys survive),
-   `user/userprograms.nix` is emptied if you said "none", the offset is
-   swapped if you said yes. These are uncommitted changes waiting for you.
+4. The clone the installer runs from is **copied without its `.git`** to
+   `~/GNOMS` on the target (same commit the questions came from, no second
+   download, no tie to upstream) and your answers are written into it: the
+   profile values are replaced in place in `user/userprofile.nix`
+   (comments and custom keys survive), `user/userprograms.nix` is emptied
+   if you said "none", the offset is swapped if you said yes.
 5. The flake files and `user/` are copied next to the hardware config in
    `/etc/nixos`, exactly like `reconfigure rebuild` does later, and a
    second `nixos-install --flake /mnt/etc/nixos#<hostname>` builds GNOMS.
    No reboot in between: `nixos-install` is a chroot install driven from
    the stick. The baseline stays selectable in GRUB, and its config is kept
    as `/etc/nixos/configuration.baseline.nix`.
-6. Handoff text (how to treat the system, what to commit), then "unmount
-   and reboot now?".
+6. Handoff text: how to treat the system, and the exact commands to turn
+   `~/GNOMS` into your own repo (`git init`, push to an empty remote,
+   optionally add the upstream remote to pull improvements later). Then
+   "unmount and reboot now?".
 
 Machine facts collected along the way (`/tmp/gnoms-facts` on the stick,
 copied to `/etc/nixos/gnoms-install-facts` on the target) are plain
@@ -201,3 +203,6 @@ into bare NixOS. Log in, fix what broke, then `cd ~/GNOMS/nixos &&
   NixOS.
 - **The profile file is rewritten in place, not regenerated,** so its
   comments and any custom-key documentation survive.
+- **The copy on the target has no git history.** Deliberate: an install
+  must never be bound to the repo it came from. The user makes it a repo
+  of their own afterwards; the handoff prints the commands.

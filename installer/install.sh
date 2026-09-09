@@ -468,21 +468,25 @@ register_gnoms_boot_entry() {
 }
 
 # Put the repo on the fresh system at ~/GNOMS — the path reconfigure.sh
-# expects. It is a copy of the clone the installer is running from (full
-# clone, made by bootstrap.sh), so the repo the questions were derived from
-# and the repo that gets installed are the same commit. No second download.
-# Its origin (the URL bootstrap used, or a local checkout's own remote) is
-# recorded as a fact.
+# expects. It is a copy of the clone the installer is running from, so the
+# files the questions were derived from and the files installed are the
+# same commit. No second download.
+#
+# The copy carries NO .git: a fresh install is never tied to the upstream
+# repo. The handoff tells the user to `git init` and push to their own
+# remote (and how to add upstream back if they want to pull improvements).
+# The upstream URL is recorded as a fact only so the handoff can print it.
 pull_repo() {
 	local user url dest ids
 	user=$(fact_get username)
 	url=$(git -c safe.directory="$REPO" -C "$REPO" remote get-url origin 2>/dev/null || echo "${GNOMS_REPO_URL:-unknown}")
 	fact_set repo_url "$url"
 	dest="$MNT/home/$user/GNOMS"
-	step "Copying repo → /home/$user/GNOMS on the target (origin: $url)…"
+	step "Copying repo → /home/$user/GNOMS on the target (without .git)…"
 	rm -rf "$dest"
 	mkdir -p "$(dirname "$dest")"
 	cp -a "$REPO" "$dest"
+	rm -rf "$dest/.git"
 	# uid:gid as the target assigned them (nixos-install created the user).
 	ids=$(awk -F: -v u="$user" '$1==u { print $3":"$4 }' "$MNT/etc/passwd")
 	[ -n "$ids" ] || die "User $user not found in $MNT/etc/passwd after install."
@@ -767,32 +771,8 @@ write_userprograms() {
 # the machine boots straight into the finished GNOMS. The baseline stays
 # in GRUB's generation list as the safety net.
 
-# Optional: the user's own fork. GNOMS is meant to be forked; if they have
-# one already, origin on the target copy points at it from the start.
-ask_fork() {
-	local url
-	section "Your fork"
-	echo "  GNOMS is meant to be forked and spun, not used as-is. If you already"
-	echo "  made your fork, give its URL and ~/GNOMS will push there. Enter = not yet."
-	url=$(ask_def "Your fork's git URL" "")
-	fact_set fork_url "$url"
-}
-
-set_fork_remote() {
-	local url dest
-	url=$(fact_get fork_url)
-	[ -n "$url" ] || return 0
-	dest="$MNT/home/$(fact_get username)/GNOMS"
-	# The copy is owned by the new user; git (as root) refuses "dubious
-	# ownership" without safe.directory.
-	git -c safe.directory="$dest" -C "$dest" remote set-url origin "$url" && success "origin → $url"
-}
-
 # Shown once, right before the long unattended part starts.
 intro_unattended() {
-	local url fork
-	url=$(git -c safe.directory="$REPO" -C "$REPO" remote get-url origin 2>/dev/null || echo "${GNOMS_REPO_URL:-the repo}")
-	fork=$(fact_get fork_url)
 	section "Installing"
 	cat <<EOF
   Everything is answered — from here on nothing needs you. It takes a while
@@ -807,21 +787,13 @@ intro_unattended() {
        thing 'reconfigure rebuild' does from now on. No reboot in between:
        the machine boots straight into the finished system.
 
-  Meanwhile, make it yours. GNOMS is meant to be forked, not used as-is:
-  a fork is where your profile, programs and tweaks live, and where
-  'reconfigure' pulls from on every machine you install.
+  Meanwhile, make it yours. The copy in your home carries no git history —
+  it is not tied to the repo it came from. GNOMS is meant to be your own
+  system, not somebody else's: after the first boot, make an empty repo on
+  GitHub (or anywhere) and put ~/GNOMS in it. The exact commands are in
+  the final message.
+
 EOF
-	if [ -n "$fork" ]; then
-		echo "  ~/GNOMS already points at your fork: $fork"
-		echo "  After the first boot:   cd ~/GNOMS && git commit -am 'my machine' && git push"
-	else
-		echo "  Fork $url on GitHub now, then after the first boot:"
-		echo "      cd ~/GNOMS && git remote set-url origin <your fork>"
-		echo "      git commit -am 'my machine' && git push"
-	fi
-	echo "  Your profile, programs and hibernation offset are already waiting there"
-	echo "  as uncommitted changes."
-	echo
 }
 
 # Same as reconfigure.sh's sync_flake, against the target: the flake files
@@ -859,8 +831,8 @@ install_gnoms() {
 }
 
 handoff() {
-	local user host
-	user=$(fact_get username); host=$(fact_get hostname)
+	local user host upstream
+	user=$(fact_get username); host=$(fact_get hostname); upstream=$(fact_get repo_url)
 	if [ "$(fact_get gnoms_installed)" = true ]; then
 		section "Done — GNOMS is installed on $host"
 	else
@@ -875,12 +847,23 @@ handoff() {
       reconfigure update    update flake inputs (packages) without activating
       reconfigure upgrade   update, then rebuild
     user/     yours: profile, programs, logo, wallpaper
-    nixos/ dotfiles/ scripts/   the managed system — fork it, then change it
+    nixos/ dotfiles/ scripts/   the rest of the system — read it, then change it
     /etc/nixos/hardware-configuration.nix   this machine's; never goes in the repo
 
-  First things after the first boot, as $user:
-    1. cd ~/GNOMS && git status      — your answers sit there uncommitted
-    2. commit and push them to your fork (see above if you have none yet)
+  Make ~/GNOMS your own repo (it has no git history on purpose). After the
+  first boot, as $user, with an empty repo created on GitHub or wherever:
+
+      cd ~/GNOMS
+      git init -b master
+      git add -A && git commit -m "my machine"
+      git remote add origin <your repo URL>
+      git push -u origin master
+
+  Want to pull future improvements from where this came from?
+      git remote add upstream ${upstream}
+      git fetch upstream && git merge upstream/master   (when you feel like it)
+
+  No repo at all is fine too — ~/GNOMS works without git. Just keep a copy.
 
 EOF
 }
@@ -961,7 +944,6 @@ ask_baseline_facts
 ask_resume_offset
 ask_profile
 ask_programs
-ask_fork
 
 # -------------------- Unattended: install + repo + GNOMS --------------------
 intro_unattended
@@ -970,7 +952,6 @@ write_baseline_config
 install_baseline
 register_gnoms_boot_entry
 pull_repo
-set_fork_remote
 apply_resume_offset
 write_userprofile
 write_userprograms
@@ -978,10 +959,9 @@ sync_flake_target
 install_gnoms
 
 echo
-origin=$(fact_get fork_url); origin=${origin:-$(fact_get repo_url)}
 success "Summary:"
 echo "    host: $(fact_get hostname) | user: $(fact_get username) | dualboot: $(fact_get dualboot)"
-echo "    repo: $(fact_get repo_url) → /home/$(fact_get username)/GNOMS (origin: $origin)"
+echo "    repo: $(fact_get repo_url) → /home/$(fact_get username)/GNOMS (no git history, yours to init)"
 echo "    per-machine config: /etc/nixos/hardware-configuration.nix"
 handoff
 finish
