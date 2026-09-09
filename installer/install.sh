@@ -2,42 +2,37 @@
 # install.sh — the GNOMS installer. Lives in the repo (fetched at install
 # time by bootstrap.sh), so it can grow without the ISO going stale.
 #
-# Usage: install.sh [repo-root]    (bootstrap.sh passes the clone path)
+# Usage: install.sh <repo-root>    (bootstrap.sh passes its clone, /tmp/gnoms;
+#                                   on a machine that already has GNOMS: ~/GNOMS)
 #
-# Implements: Phase 1 — partitioning + LUKS2 + swapfile/resume_offset.
-# Phases 3-6 (baseline install, repo pull, profile/programs questions,
-# handoff) slot in at the marked TODOs.
+# Implements: Phase 1 — partitioning + LUKS2 + swapfile.
+#             Phase 3 — baseline NixOS install + repo copy onto the target.
+#             Phase 4 — profile questions → user/userprofile.nix on the target.
+#             Phase 5 — programs: all or none → user/userprograms.nix on the target.
+#             Phase 6 — flake sync + full GNOMS build (second nixos-install
+#                       pass, no reboot in between) + handoff + reboot.
 #
-# VM testing: set GNOMS_STOP_AFTER_PARTITION=1 to stop once the disk is
+# For inspection: set GNOMS_STOP_AFTER_PARTITION=1 to stop once the disk is
 # prepared and mounted, so the result can be inspected before continuing.
 
 set -euo pipefail
 
-REPO="${1:-}"
+[ -n "${1:-}" ] && [ -d "$1/installer" ] ||
+	{ echo "usage: $0 <repo-root>   (the GNOMS checkout to install from)" >&2; exit 1; }
+REPO="$1"
 FACTS="/tmp/gnoms-facts"
 KEYMAP_FILE="/tmp/gnoms-keymap"
 MNT="/mnt"
+TARGET_NIXOS="$MNT/etc/nixos"
+
+# Shared look (colors, prompts, banner, section) + the logo from the repo.
+GNOMS_LOGO="$REPO/user/logo.txt"
+source "$REPO/installer/ui.sh"
 
 ESP_GUID="c12a7328-f81f-11d2-ba4b-00a0c93ec93b"
 ESP_DEFAULT_MB=1024
 MIN_ROOT_MB=20480   # warn if root gets under 20 GiB
 SWAP_MIN_MB=1024
-
-# -------------------- Colors / output --------------------
-GREEN="\033[1;32m"
-PURPLE="\033[38;2;135;0;255m"
-RED="\033[1;31m"
-YELLOW="\033[1;33m"
-RESET="\033[0m"
-
-step()    { echo -e "${PURPLE}[  ▶▶  ]${RESET} $1"; }
-success() { echo -e "${GREEN}[  OK  ]${RESET} $1"; }
-warn()    { echo -e "${YELLOW}[ WARN ]${RESET} $1"; }
-die()     { echo -e "${RED}[  !!  ]${RESET} $1" >&2; exit 1; }
-
-ask()      { local v; read -r -p "$1" v; echo "$v"; }
-ask_def()  { local v; read -r -p "$1 [$2]: " v; echo "${v:-$2}"; }
-confirm()  { local a; read -r -p "$1 [y/N]: " a; [[ "$a" =~ ^[Yy] ]]; }
 
 # -------------------- Facts (machine-generated, for later phases) ----------
 # KEY=VALUE lines. Phase 4 turns these into userprofile/configuration bits.
@@ -147,8 +142,8 @@ mapper_of() {	# luks mapper name convention must match nixos-generate-config
 format_luks_root() {	# format_luks_root PART — prompts for passphrase
 	local part="$1" pass pass2 uuid
 	while true; do
-		read -r -s -p "  LUKS passphrase for root (unlocks the disk on every boot): " pass; echo
-		read -r -s -p "  Repeat: " pass2; echo
+		pass=$(ask_secret "LUKS passphrase for root (unlocks the disk on every boot):")
+		pass2=$(ask_secret "Repeat:")
 		[ -n "$pass" ] && [ "$pass" = "$pass2" ] && break
 		warn "Passphrases empty or don't match — try again."
 	done
@@ -170,11 +165,30 @@ mount_system() {	# mount_system MAPPER ESP_PART — root first, then ESP
 	fact_set root_fs_uuid "$(blkid -s UUID -o value "$mapper")"
 }
 
+# Swap size configuration.nix declares (swapDevices … size = <expr>;), in MB.
+# NixOS recreates the swapfile at that size on the first rebuild if it
+# differs, which would move the resume_offset — so the installer defaults to
+# it. Empty if the repo has no size key.
+config_swap_mb() {
+	local expr
+	expr=$(sed -n 's/^[[:space:]]*size[[:space:]]*=[[:space:]]*\([^;]*\);.*/\1/p' \
+		"$REPO/nixos/configuration.nix" 2>/dev/null | head -1)
+	[[ "$expr" =~ ^[0-9\ \*\+\-\(\)]+$ ]] || return 0
+	echo $(( expr ))
+}
+
 make_swap() {	# make_swap MNT — swapfile lives on the encrypted root
-	local mnt="$1" ram_mb size_mb offset
+	local mnt="$1" ram_mb cfg_mb default_mb size_mb offset
 	ram_mb=$(awk '/MemTotal/ { printf "%d", $2/1024 }' /proc/meminfo)
+	cfg_mb=$(config_swap_mb)
+	default_mb="${cfg_mb:-$ram_mb}"
+	if [ -n "$cfg_mb" ]; then
+		echo "  configuration.nix declares a ${cfg_mb} MB swapfile; NixOS recreates it at that"
+		echo "  size on the first rebuild, so a different choice here is overwritten."
+	fi
+	[ "$default_mb" -lt "$ram_mb" ] && warn "That is less than this machine's RAM (${ram_mb} MB) — hibernation may not fit."
 	while true; do
-		size_mb=$(ask_def "  Swapfile size in MB (must be ≥ RAM for hibernation)" "$ram_mb")
+		size_mb=$(ask_def "  Swapfile size in MB" "$default_mb")
 		[[ "$size_mb" =~ ^[0-9]+$ ]] && [ "$size_mb" -ge "$SWAP_MIN_MB" ] && break
 		warn "Enter a number ≥ ${SWAP_MIN_MB}."
 	done
@@ -186,9 +200,7 @@ make_swap() {	# make_swap MNT — swapfile lives on the encrypted root
 	offset=$(filefrag -v "$mnt/var/lib/swapfile" | awk 'NR==4 { print $4+0 }')
 	fact_set swapfile_size_mb "$size_mb"
 	fact_set resume_offset "$offset"
-	success "Swapfile ready; resume_offset=$offset"
-	# Phase 4 note: configuration.nix's swapDevices must drop its `size` key
-	# so NixOS never recreates/resizes the file (that would move the offset).
+	success "Swapfile ready; resume_offset=$offset (configuration.nix hardcodes this value — update it by hand)"
 }
 
 # -------------------- Partitioning modes --------------------
@@ -295,12 +307,607 @@ prep_existing_partition() {	# advanced: reformat a chosen partition as root
 	mount_system "$(mapper_of "$part")" "$esp"
 }
 
+# -------------------- Phase 3: baseline install --------------------
+
+# Read a string key out of a userprofile.nix (line: key = "value";). Used
+# for defaults only — Phase 4 does the real profile generation.
+profile_get() {	# profile_get KEY -> value or empty
+	sed -n "s/^[[:space:]]*$1[[:space:]]*=[[:space:]]*\"\([^\"]*\)\".*/\1/p" \
+		"$REPO/user/userprofile.nix" 2>/dev/null | head -1
+}
+
+# Ask the few facts a bootable bare NixOS needs: user, host, password.
+# Defaults come from the repo's userprofile so the repo owner just hits
+# Enter; Phase 4 reuses the answers as defaults for the full profile.
+ask_baseline_facts() {
+	local user host pass pass2
+	section "Baseline system"
+	while true; do
+		user=$(ask_def "  Username" "$(profile_get username)")
+		[[ "$user" =~ ^[a-z_][a-z0-9_-]{0,31}$ ]] && break
+		warn "Lowercase letters, digits, '-' and '_' only; must start with a letter."
+	done
+	while true; do
+		host=$(ask_def "  Hostname" "$(profile_get hostname)")
+		[[ "$host" =~ ^[a-zA-Z0-9]([a-zA-Z0-9-]{0,62})$ ]] && break
+		warn "Letters, digits and '-' only."
+	done
+	while true; do
+		pass=$(ask_secret "Password for $user (sudo via wheel; root stays locked):")
+		pass2=$(ask_secret "Repeat:")
+		[ -n "$pass" ] && [ "$pass" = "$pass2" ] && break
+		warn "Passwords empty or don't match — try again."
+	done
+	fact_set username "$user"
+	fact_set hostname "$host"
+	# Hash never enters the facts file; it goes straight into the config.
+	PASSWORD_HASH=$(hash_password "$pass")
+}
+
+hash_password() {	# hash_password PLAINTEXT -> sha-512 crypt hash (via stdin, never argv)
+	if command -v mkpasswd &>/dev/null; then
+		printf '%s' "$1" | mkpasswd -m sha-512 -s
+	elif command -v openssl &>/dev/null; then
+		printf '%s' "$1" | openssl passwd -6 -stdin
+	else
+		die "Neither mkpasswd nor openssl available to hash the password."
+	fi
+}
+
+# system.stateVersion must match what the repo's configuration.nix carries,
+# otherwise the first GNOMS rebuild flips it. Fall back to the live release.
+state_version() {
+	local sv
+	sv=$(sed -n 's/.*system\.stateVersion[[:space:]]*=[[:space:]]*"\([^"]*\)".*/\1/p' \
+		"$REPO/nixos/configuration.nix" 2>/dev/null | head -1)
+	[ -n "$sv" ] || sv=$(nixos-version 2>/dev/null | cut -d. -f1,2)
+	echo "$sv"
+}
+
+# nixos-generate-config writes the per-machine hardware-configuration.nix
+# (filesystems by UUID, the luks-<uuid> initrd device, drivers). That file
+# stays in /etc/nixos forever and is never copied into the repo.
+generate_hardware_config() {
+	local hw="$TARGET_NIXOS/hardware-configuration.nix"
+	step "Generating hardware-configuration.nix for the target…"
+	nixos-generate-config --root "$MNT"
+	[ -f "$hw" ] || die "nixos-generate-config produced no $hw"
+	success "hardware-configuration.nix written"
+}
+
+# Baseline configuration.nix: bare NixOS that boots, gets on the network
+# and has the user + git. GNOMS's own configuration.nix replaces this file
+# on the first `reconfigure rebuild`; only hardware-configuration.nix stays.
+# The boot block mirrors nixos/configuration.nix (Phase 2): dual boot →
+# --no-nvram install so the host OS's boot order is never touched.
+write_baseline_config() {
+	local cfg="$TARGET_NIXOS/configuration.nix" dualboot user host keymap sv touch_efi keymap_line=""
+	dualboot=$(fact_get dualboot)
+	user=$(fact_get username)
+	host=$(fact_get hostname)
+	keymap=$(fact_get keyboard_layout)
+	sv=$(state_version)
+	if [ "$dualboot" = true ]; then touch_efi=false; else touch_efi=true; fi
+	[ -n "$keymap" ] && keymap_line="  console.keyMap = \"${keymap}\";"
+	step "Writing baseline configuration.nix (dualboot=${dualboot})…"
+	cat > "$cfg" <<EOF
+# Baseline NixOS written by the GNOMS installer (installer/install.sh).
+# Just enough to boot, reach the network and log in. It is replaced by
+# GNOMS's own configuration.nix on the first \`reconfigure rebuild\`;
+# hardware-configuration.nix next to it is per-machine and stays.
+{ config, pkgs, ... }:
+
+{
+  imports = [ ./hardware-configuration.nix ];
+  nix.settings.experimental-features = [ "nix-command" "flakes" ];
+
+  # dualboot=${dualboot}: canTouchEfiVariables=false makes grub-install run
+  # with --no-nvram; the installer registers the "GNOMS" firmware entry
+  # itself (--create-only, never reorders the boot menu).
+  boot.loader.systemd-boot.enable = false;
+  boot.loader.efi.canTouchEfiVariables = ${touch_efi};
+  boot.loader.grub = {
+    enable = true;
+    efiSupport = true;
+    device = "nodev";
+    useOSProber = ${dualboot};
+  };
+
+  # Swapfile created by the installer on the encrypted root (no size key,
+  # so NixOS never recreates it).
+  swapDevices = [{ device = "/var/lib/swapfile"; }];
+
+  networking.hostName = "${host}";
+  networking.networkmanager.enable = true;
+${keymap_line}
+  users.users.${user} = {
+    isNormalUser = true;
+    extraGroups = [ "wheel" "networkmanager" ];
+    hashedPassword = "${PASSWORD_HASH}";
+  };
+
+  environment.systemPackages = with pkgs; [ git neovim ];
+
+  system.stateVersion = "${sv}";
+}
+EOF
+	chmod 600 "$cfg"	# holds the password hash
+	success "Baseline configuration.nix written"
+}
+
+install_baseline() {
+	step "Installing baseline NixOS onto $MNT (this downloads packages — grab a coffee)…"
+	nixos-install --root "$MNT" --no-root-passwd
+	success "Baseline NixOS installed"
+}
+
+# Dual boot: grub-install ran with --no-nvram, so NixOS's GRUB sits at
+# /EFI/<distro>-boot on the ESP with no firmware entry pointing at it.
+# Same recipe as boot.loader.grub.extraInstallCommands in
+# nixos/configuration.nix (Phase 2), run once here so the bare system is
+# bootable even before the first GNOMS rebuild: copy the binary to a
+# stable path and add a "GNOMS" entry without reordering the boot menu.
+register_gnoms_boot_entry() {
+	[ "$(fact_get dualboot)" = true ] || return 0
+	local esp src disk partnum
+	esp=$(fact_get esp_part)
+	src=$(ls "$MNT"/boot/EFI/*-boot/grubx64.efi 2>/dev/null | head -1)
+	[ -n "$src" ] || die "No GRUB binary under $MNT/boot/EFI/*-boot/ — did nixos-install run grub-install?"
+	step "Registering contained GNOMS boot entry (host boot order untouched)…"
+	mkdir -p "$MNT/boot/EFI/GNOMS"
+	cp -f "$src" "$MNT/boot/EFI/GNOMS/grubx64.efi"
+	disk=$(lsblk -no PKNAME "$esp")
+	partnum=$(cat "/sys/class/block/$(basename "$esp")/partition")
+	if efibootmgr -v | grep -qF '\EFI\GNOMS'; then
+		success "Firmware entry for \\EFI\\GNOMS already present"
+	else
+		efibootmgr --create-only --quiet --label GNOMS \
+			--disk "/dev/$disk" --part "$partnum" --loader '\EFI\GNOMS\grubx64.efi'
+		success "Firmware entry 'GNOMS' added (pick it in the boot menu)"
+	fi
+}
+
+# Put the repo on the fresh system at ~/GNOMS — the path reconfigure.sh
+# expects. It is a copy of the clone the installer is running from (full
+# clone, made by bootstrap.sh), so the repo the questions were derived from
+# and the repo that gets installed are the same commit. No second download.
+# Its origin (the URL bootstrap used, or a local checkout's own remote) is
+# recorded as a fact.
+pull_repo() {
+	local user url dest ids
+	user=$(fact_get username)
+	url=$(git -c safe.directory="$REPO" -C "$REPO" remote get-url origin 2>/dev/null || echo "${GNOMS_REPO_URL:-unknown}")
+	fact_set repo_url "$url"
+	dest="$MNT/home/$user/GNOMS"
+	step "Copying repo → /home/$user/GNOMS on the target (origin: $url)…"
+	rm -rf "$dest"
+	mkdir -p "$(dirname "$dest")"
+	cp -a "$REPO" "$dest"
+	# uid:gid as the target assigned them (nixos-install created the user).
+	ids=$(awk -F: -v u="$user" '$1==u { print $3":"$4 }' "$MNT/etc/passwd")
+	[ -n "$ids" ] || die "User $user not found in $MNT/etc/passwd after install."
+	chown -R "$ids" "$MNT/home/$user"
+	success "Repo in place, owned by $user ($ids)"
+}
+
+# configuration.nix hardcodes `resume_offset=<n>` — the physical position of
+# /var/lib/swapfile on the machine the repo was last installed on. This
+# machine's swapfile was just created, so its offset (fact resume_offset)
+# is usually different. Offer to replace the literal in the *cloned* repo
+# on the target; that is the only edit, and the user commits it as part of
+# their own spin.
+#
+# Split in two so the question sits with the other questions (the offset
+# is known right after the disk step) and the edit happens once the repo
+# is on the target: ask_resume_offset → fact resume_offset_old (+ _apply);
+# apply_resume_offset does the sed.
+ask_resume_offset() {
+	local old new
+	new=$(fact_get resume_offset)
+	old=$(sed -n 's/.*resume_offset=\([0-9]\+\).*/\1/p' "$REPO/nixos/configuration.nix" 2>/dev/null | head -1)
+	fact_set resume_offset_apply false
+	if [ -z "$old" ]; then
+		warn "No resume_offset=<n> literal in nixos/configuration.nix — nothing to update (this machine's value is ${new})."
+		return 0
+	fi
+	fact_set resume_offset_old "$old"
+	[ "$old" = "$new" ] && { success "resume_offset in configuration.nix already matches this machine (${old})."; return 0; }
+
+	section "Hibernation offset"
+	echo "  The repo's configuration.nix says   resume_offset=${old}"
+	echo "  This machine's new swapfile sits at resume_offset=${new}"
+	echo
+	echo "  The offset is where the swapfile physically lands on the disk, so it"
+	echo "  differs per install. Hibernation only resumes from the right one: with"
+	echo "  the old value this machine would hibernate fine but boot fresh instead"
+	echo "  of resuming. Replacing it changes one number in the cloned repo, which"
+	echo "  you then commit to your own fork."
+	if confirm "Use ${new} in nixos/configuration.nix?"; then
+		fact_set resume_offset_apply true
+	else
+		warn "Keeping resume_offset=${old}; hibernation will not resume on this machine until it is updated."
+	fi
+}
+
+apply_resume_offset() {
+	[ "$(fact_get resume_offset_apply)" = true ] || return 0
+	local cfg old new
+	cfg="$MNT/home/$(fact_get username)/GNOMS/nixos/configuration.nix"
+	old=$(fact_get resume_offset_old)
+	new=$(fact_get resume_offset)
+	sed -i "s/resume_offset=${old}/resume_offset=${new}/" "$cfg"
+	success "configuration.nix now uses resume_offset=${new} (uncommitted change in ~/GNOMS)"
+}
+
+# -------------------- Phase 4: the profile --------------------
+# Keys are derived from the repo's user/userprofile.nix, never hardcoded:
+# nix evaluates the file (types + values), the file's own line order gives
+# the question order. One question per key, default = the repo's value.
+# Answers → facts `profile_<key>=<type>:<value>`; write_userprofile later
+# swaps the values in place in the target's copy (comments, order and any
+# key of a type we do not ask about stay untouched).
+
+PROFILE_FILE="user/userprofile.nix"
+# Keys the installer already knows — asked earlier or computed, never asked here.
+PROFILE_FROM_FACTS="username hostname keyboard_layout dualboot"
+
+# key<TAB>type<TAB>value per line, in file order. Only string/bool/int
+# are askable; other types are listed so they can be reported as kept.
+profile_read() {
+	local f="$REPO/$PROFILE_FILE" evald order k
+	evald=$(nix --extra-experimental-features 'nix-command flakes' eval --raw --file "$f" --apply '
+		p: builtins.concatStringsSep "\n" (map (k:
+			let v = p.${k}; t = builtins.typeOf v;
+			in "${k}\t${t}\t" + (if t == "bool" then (if v then "true" else "false")
+			                     else if t == "string" || t == "int" then toString v
+			                     else "")
+		) (builtins.attrNames p))') ||
+		die "Could not evaluate $PROFILE_FILE with nix."
+	order=$(sed -n 's/^[[:space:]]*\([A-Za-z_][A-Za-z0-9_]*\)[[:space:]]*=.*/\1/p' "$f")
+	for k in $order; do
+		awk -F'\t' -v k="$k" '$1 == k' <<<"$evald"
+	done
+}
+
+profile_hint() {	# one line of context per known key; custom keys get a generic one
+	case "$1" in
+		timezone)     echo "IANA name, e.g. Europe/Oslo" ;;
+		locale)       echo "system language and formats, e.g. en_GB.UTF-8" ;;
+		terminal)     echo "command name; exported as \$TERMINAL system-wide" ;;
+		editor)       echo "command name; exported as \$EDITOR system-wide" ;;
+		browser)      echo "command name; exported as \$BROWSER system-wide" ;;
+		boot_timeout) echo "seconds the GRUB menu waits before booting the default entry" ;;
+		github_name)  echo "git commit author name" ;;
+		github_email) echo "git commit author email" ;;
+		*)            echo "custom key of this fork (read as profile.$1 in its nix files)" ;;
+	esac
+}
+
+# Ask one key; validation depends on the type (and a few known keys).
+# Called inside $(…): only the answer goes to stdout, everything else to
+# stderr (read -p already prompts on stderr).
+profile_ask_key() {	# profile_ask_key KEY TYPE DEFAULT -> prints the answer
+	local k="$1" t="$2" d="$3" v yn
+	echo -e "    ${DIM}$(profile_hint "$k")${RESET}" >&2
+	while true; do
+		case "$t" in
+			bool)
+				yn=n; [ "$d" = true ] && yn=y
+				v=$(ask_def "$k (y/n)" "$yn")
+				case "$v" in
+					[Yy]*|true)  echo true; return ;;
+					[Nn]*|false) echo false; return ;;
+				esac
+				warn "Answer y or n." >&2 ;;
+			int)
+				v=$(ask_def "$k" "$d")
+				[[ "$v" =~ ^-?[0-9]+$ ]] && { echo "$v"; return; }
+				warn "Enter a whole number." >&2 ;;
+			string)
+				v=$(ask_def "$k" "$d")
+				[ -n "$v" ] || { warn "Cannot be empty." >&2; continue; }
+				if [ "$k" = timezone ] && [ -d /etc/zoneinfo ] && [ ! -e "/etc/zoneinfo/$v" ]; then
+					warn "Unknown timezone '$v' (see /etc/zoneinfo)." >&2; continue
+				fi
+				if [ "$k" = locale ] && [[ ! "$v" =~ ^[a-z]{2,3}(_[A-Z]{2})?(\.[A-Za-z0-9-]+)?(@[a-z]+)?$ ]]; then
+					warn "Does not look like a locale (e.g. en_GB.UTF-8)." >&2; continue
+				fi
+				echo "$v"; return ;;
+		esac
+	done
+}
+
+ask_profile() {
+	local mode line k t d v skipped=""
+	section "Profile"
+	echo "  user/userprofile.nix holds the personal settings every GNOMS file reads."
+	echo "    1) Setup (recommended) — go through each key; Enter keeps the repo's value"
+	echo "    2) Use this exact setup — zero questions; only for the repo's own owner"
+	mode=$(ask_def "Choice" "1")
+	[ "$mode" = 1 ] || [ "$mode" = 2 ] || die "Bad choice."
+
+	# Keys the installer already knows are always applied from facts —
+	# in both modes — so profile and baseline never disagree.
+	for k in $PROFILE_FROM_FACTS; do
+		v=$(fact_get "$k")
+		[ -n "$v" ] || continue
+		t=string; [ "$k" = dualboot ] && t=bool
+		fact_set "profile_$k" "$t:$v"
+	done
+	if [ "$mode" = 2 ]; then
+		success "Keeping the repo's profile (username/hostname/keyboard/dualboot from this install)."
+		return 0
+	fi
+
+	# Read everything first (so a nix failure dies here), then loop on fd 3 —
+	# stdin stays the terminal for the prompts inside the loop.
+	local data
+	data=$(profile_read)
+	echo
+	while IFS=$'\t' read -r -u 3 k t d; do
+		[ -n "$k" ] || continue
+		# Known keys are skipped only when a fact actually exists for them
+		# (keyboard_layout has none when run outside the ISO).
+		case " $PROFILE_FROM_FACTS " in *" $k "*) [ -z "$(fact_get "$k")" ] || continue ;; esac
+		case "$t" in
+			string|bool|int) ;;
+			*) skipped="$skipped $k($t)"; continue ;;
+		esac
+		v=$(profile_ask_key "$k" "$t" "$d")
+		fact_set "profile_$k" "$t:$v"
+	done 3<<<"$data"
+	[ -z "$skipped" ] || warn "Kept as-is (not askable):${skipped}"
+	success "Profile answers recorded."
+}
+
+# Escape a shell string for use inside a Nix double-quoted string.
+nix_str() { local s="$1"; s="${s//\\/\\\\}"; s="${s//\"/\\\"}"; s="${s//\$\{/\\\$\{}"; printf '"%s"' "$s"; }
+
+# Replace `key = …;` in place in the target's userprofile.nix, one key at a
+# time. Indentation is kept; a trailing comment on that line is not.
+write_userprofile() {
+	local user f line k tv t v
+	user=$(fact_get username)
+	f="$MNT/home/$user/GNOMS/$PROFILE_FILE"
+	[ -f "$f" ] || die "No $f on the target — repo copy missing?"
+	step "Writing profile answers into ~/GNOMS/$PROFILE_FILE…"
+	local rc
+	while IFS='=' read -r line tv; do
+		k="${line#profile_}"
+		t="${tv%%:*}"; v="${tv#*:}"
+		[ "$t" = string ] && v=$(nix_str "$v")
+		rc=0
+		K="$k" V="$v" awk '
+			!done && $0 ~ "^[[:space:]]*" ENVIRON["K"] "[[:space:]]*=" {
+				match($0, /^[[:space:]]*/)
+				print substr($0, 1, RLENGTH) ENVIRON["K"] " = " ENVIRON["V"] ";"
+				done = 1; next
+			}
+			{ print }
+			END { if (!done) exit 3 }
+		' "$f" > "$f.tmp" || rc=$?
+		if [ "$rc" -eq 3 ]; then
+			# Key missing from the file (e.g. keyboard_layout on a fork that
+			# dropped it): add it before the closing brace.
+			warn "Key '$k' not in $PROFILE_FILE — appending it."
+			sed '$ d' "$f" > "$f.tmp"; printf '  %s = %s;\n}\n' "$k" "$v" >> "$f.tmp"
+		elif [ "$rc" -ne 0 ]; then
+			die "awk failed rewriting $PROFILE_FILE (key $k)."
+		fi
+		mv "$f.tmp" "$f"
+	done < <(grep '^profile_' "$FACTS")
+	chown "$(stat -c %u:%g "$(dirname "$f")")" "$f"
+	success "$PROFILE_FILE updated (uncommitted change in ~/GNOMS)"
+}
+
+# -------------------- Phase 5: the programs --------------------
+# Everything in configuration.nix / home.nix installs regardless — that is
+# the baseline. user/userprograms.nix is the only opt-out surface, and the
+# choice is all-or-nothing: show the repo's list, ask "all of them" or
+# "none of them (faster install)". No individual picking. Fact
+# `programs_mode=all|none`; write_userprograms empties the file for none.
+
+PROGRAMS_FILE="user/userprograms.nix"
+
+# The list bodies of userprograms.nix as written (names, trailing comments,
+# group comments), for display. Read textually: the file's own rule is one
+# name per line.
+show_programs() {
+	local f="$REPO/$PROGRAMS_FILE" n
+	n=$(sed 's/#.*//' "$f" | grep -cE '^[[:space:]]+[A-Za-z0-9_][A-Za-z0-9_.-]*[[:space:]]*$' || true)
+	echo "  $PROGRAMS_FILE lists ${n} programs beyond the baseline:"
+	echo
+	awk '
+		/^[[:space:]]*(system|user)[[:space:]]*=[[:space:]]*\[/ { inlist = 1; label = $1; next }
+		inlist && /^[[:space:]]*\];/ { inlist = 0; next }
+		inlist && NF { sub(/^[[:space:]]+/, ""); if ($0 ~ /^#/) print "    " $0; else print "      " $0 }
+	' "$f"
+	echo
+	return 0
+}
+
+ask_programs() {
+	local mode
+	section "Programs"
+	show_programs
+	echo "  The core system (configuration.nix / home.nix) installs either way."
+	echo "    1) All of them (Enter) — the fork owner's full setup"
+	echo "    2) None of them — faster install; add programs later in $PROGRAMS_FILE"
+	mode=$(ask_def "Choice" "1")
+	case "$mode" in
+		1) fact_set programs_mode all;  success "Installing the full program list." ;;
+		2) fact_set programs_mode none; success "No extra programs — $PROGRAMS_FILE will be emptied." ;;
+		*) die "Bad choice." ;;
+	esac
+}
+
+# For "none": rewrite the target's userprograms.nix with empty lists. The
+# header comment (it documents the module-managed programs) is kept:
+# everything above the `{ pkgs, ... }:` line.
+write_userprograms() {
+	[ "$(fact_get programs_mode)" = none ] || return 0
+	local f header
+	f="$MNT/home/$(fact_get username)/GNOMS/$PROGRAMS_FILE"
+	[ -f "$f" ] || die "No $f on the target — repo copy missing?"
+	step "Emptying ~/GNOMS/$PROGRAMS_FILE…"
+	header=$(sed -n '/^{ pkgs/q;p' "$f")
+	{
+		[ -n "$header" ] && printf '%s\n' "$header"
+		printf '{ pkgs, ... }: with pkgs; {\n  system = [\n\n  ];\n\n  user = [\n\n  ];\n}\n'
+	} > "$f.tmp"
+	mv "$f.tmp" "$f"
+	chown "$(stat -c %u:%g "$(dirname "$f")")" "$f"
+	success "$PROGRAMS_FILE emptied (uncommitted change in ~/GNOMS)"
+}
+
+# -------------------- Phase 6: full build + handoff --------------------
+# No reboot between the baseline and GNOMS: nixos-install is a chroot
+# install driven from the ISO, so it simply runs a second time with the
+# flake (exactly what `reconfigure rebuild` does on a running system) and
+# the machine boots straight into the finished GNOMS. The baseline stays
+# in GRUB's generation list as the safety net.
+
+# Optional: the user's own fork. GNOMS is meant to be forked; if they have
+# one already, origin on the target copy points at it from the start.
+ask_fork() {
+	local url
+	section "Your fork"
+	echo "  GNOMS is meant to be forked and spun, not used as-is. If you already"
+	echo "  made your fork, give its URL and ~/GNOMS will push there. Enter = not yet."
+	url=$(ask_def "Your fork's git URL" "")
+	fact_set fork_url "$url"
+}
+
+set_fork_remote() {
+	local url dest
+	url=$(fact_get fork_url)
+	[ -n "$url" ] || return 0
+	dest="$MNT/home/$(fact_get username)/GNOMS"
+	# The copy is owned by the new user; git (as root) refuses "dubious
+	# ownership" without safe.directory.
+	git -c safe.directory="$dest" -C "$dest" remote set-url origin "$url" && success "origin → $url"
+}
+
+# Shown once, right before the long unattended part starts.
+intro_unattended() {
+	local url fork
+	url=$(git -c safe.directory="$REPO" -C "$REPO" remote get-url origin 2>/dev/null || echo "${GNOMS_REPO_URL:-the repo}")
+	fork=$(fact_get fork_url)
+	section "Installing"
+	cat <<EOF
+  Everything is answered — from here on nothing needs you. It takes a while
+  (two system builds, mostly downloads). What happens now:
+
+    1. A bare NixOS goes on first: it boots, has network and your user.
+       That is the safety net — if the GNOMS build fails, it still boots,
+       with the repo in your home to fix things from.
+    2. The repo is copied to ~/GNOMS and your answers are written into
+       user/userprofile.nix and user/userprograms.nix.
+    3. GNOMS itself is built on top, from the flake in /etc/nixos — the same
+       thing 'reconfigure rebuild' does from now on. No reboot in between:
+       the machine boots straight into the finished system.
+
+  Meanwhile, make it yours. GNOMS is meant to be forked, not used as-is:
+  a fork is where your profile, programs and tweaks live, and where
+  'reconfigure' pulls from on every machine you install.
+EOF
+	if [ -n "$fork" ]; then
+		echo "  ~/GNOMS already points at your fork: $fork"
+		echo "  After the first boot:   cd ~/GNOMS && git commit -am 'my machine' && git push"
+	else
+		echo "  Fork $url on GitHub now, then after the first boot:"
+		echo "      cd ~/GNOMS && git remote set-url origin <your fork>"
+		echo "      git commit -am 'my machine' && git push"
+	fi
+	echo "  Your profile, programs and hibernation offset are already waiting there"
+	echo "  as uncommitted changes."
+	echo
+}
+
+# Same as reconfigure.sh's sync_flake, against the target: the flake files
+# and user/ go next to the hardware-configuration.nix that Phase 3 made.
+# The baseline configuration.nix is kept as configuration.baseline.nix.
+sync_flake_target() {
+	local src f
+	src="$MNT/home/$(fact_get username)/GNOMS"
+	step "Copying the flake into $TARGET_NIXOS…"
+	cp -f "$TARGET_NIXOS/configuration.nix" "$TARGET_NIXOS/configuration.baseline.nix"
+	for f in flake.nix configuration.nix home.nix flake.lock; do
+		cp -f "$src/nixos/$f" "$TARGET_NIXOS/$f"
+	done
+	mkdir -p "$TARGET_NIXOS/user"
+	cp -f "$src/user/userprofile.nix" "$src/user/userprograms.nix" "$TARGET_NIXOS/user/"
+	chown -R root:root "$TARGET_NIXOS"
+	chmod 644 "$TARGET_NIXOS"/*.nix "$TARGET_NIXOS"/user/*.nix
+	chmod 600 "$TARGET_NIXOS/configuration.baseline.nix"	# holds the password hash
+	success "Flake and profile in place"
+}
+
+install_gnoms() {
+	local host
+	host=$(fact_get hostname)
+	step "Building GNOMS (nixos-install --flake $TARGET_NIXOS#$host) — the long one…"
+	if nixos-install --root "$MNT" --flake "$TARGET_NIXOS#$host" --no-root-passwd; then
+		fact_set gnoms_installed true
+		success "GNOMS built and installed"
+	else
+		fact_set gnoms_installed false
+		warn "The GNOMS build failed. The bare NixOS still boots (it is the GRUB default"
+		warn "generation). Log in as $(fact_get username), fix what broke, then:"
+		warn "    cd ~/GNOMS/nixos && ./reconfigure.sh rebuild"
+	fi
+}
+
+handoff() {
+	local user host
+	user=$(fact_get username); host=$(fact_get hostname)
+	if [ "$(fact_get gnoms_installed)" = true ]; then
+		section "Done — GNOMS is installed on $host"
+	else
+		section "Done — bare NixOS installed on $host (GNOMS build failed, see above)"
+	fi
+	cat <<EOF
+  How to treat this system:
+
+    ~/GNOMS is the system. Edit there — never ~/.config, never /etc/nixos.
+      reconfigure reload    sync dotfiles + scripts, restart AwesomeWM
+      reconfigure rebuild   copy the flake to /etc/nixos, nixos-rebuild switch, reload
+      reconfigure update    update flake inputs (packages) without activating
+      reconfigure upgrade   update, then rebuild
+    user/     yours: profile, programs, logo, wallpaper
+    nixos/ dotfiles/ scripts/   the managed system — fork it, then change it
+    /etc/nixos/hardware-configuration.nix   this machine's; never goes in the repo
+
+  First things after the first boot, as $user:
+    1. cd ~/GNOMS && git status      — your answers sit there uncommitted
+    2. commit and push them to your fork (see above if you have none yet)
+
+EOF
+}
+
+finish() {
+	cp -f "$FACTS" "$TARGET_NIXOS/gnoms-install-facts"	# for post-install debugging
+	if confirm "Unmount and reboot into the new system now?"; then
+		step "Unmounting…"
+		umount -R "$MNT"
+		cryptsetup close "luks-$(fact_get luks_uuid)" || true
+		success "Rebooting. Remove the USB stick when the screen goes dark."
+		reboot
+	else
+		echo "  Still mounted at $MNT for a look around. When done:"
+		echo "      umount -R $MNT && cryptsetup close luks-$(fact_get luks_uuid) && reboot"
+	fi
+}
+
 # -------------------- Main --------------------
 
 assert_root
 assert_uefi
+mountpoint -q "$MNT" && die "$MNT is already mounted (a previous run?). umount -R $MNT first."
+rm -f "$FACTS"	# never inherit answers from an earlier, aborted run
 
-echo -e "${PURPLE}  ── GNOMS installer — disk setup ──${RESET}"
+[ -n "${GNOMS_BOOTSTRAPPED:-}" ] || banner "installer"
+section "Disk setup"
 
 # Keyboard may have been set by bootstrap.sh on the ISO; apply as default.
 if [ -r "$KEYMAP_FILE" ]; then
@@ -346,9 +953,35 @@ if [ "${GNOMS_STOP_AFTER_PARTITION:-0}" = "1" ]; then
 	exit 0
 fi
 
-# TODO Phase 3: baseline NixOS install (nixos-install with generated config),
-#               repo pull onto the target, repo-URL derivation.
-# TODO Phase 4: profile questions → generate user/userprofile.nix.
-# TODO Phase 5: programs question → generate user/userprograms.nix.
-# TODO Phase 6: handoff message + kick off full build/switch.
-die "Disk setup complete, but install steps (Phase 3+) are not implemented yet."
+# -------------------- Questions (everything the user is asked) --------------------
+# All remaining questions come before the long unattended part, so the
+# user answers once and walks away. Answers go to $FACTS; the generated
+# files are written into the target's copy of the repo further down.
+ask_baseline_facts
+ask_resume_offset
+ask_profile
+ask_programs
+ask_fork
+
+# -------------------- Unattended: install + repo + GNOMS --------------------
+intro_unattended
+generate_hardware_config
+write_baseline_config
+install_baseline
+register_gnoms_boot_entry
+pull_repo
+set_fork_remote
+apply_resume_offset
+write_userprofile
+write_userprograms
+sync_flake_target
+install_gnoms
+
+echo
+origin=$(fact_get fork_url); origin=${origin:-$(fact_get repo_url)}
+success "Summary:"
+echo "    host: $(fact_get hostname) | user: $(fact_get username) | dualboot: $(fact_get dualboot)"
+echo "    repo: $(fact_get repo_url) → /home/$(fact_get username)/GNOMS (origin: $origin)"
+echo "    per-machine config: /etc/nixos/hardware-configuration.nix"
+handoff
+finish

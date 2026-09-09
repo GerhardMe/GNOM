@@ -105,7 +105,6 @@ in {
   # (where the swapfile physically lands on disk — never a user setting);
   # it must be updated whenever the swapfile is (re)created:
   #   sudo filefrag -v /var/lib/swapfile | awk 'NR==4 {print $4+0}'
-  # Phase 3 will move this value into the installer-generated config.
   boot.resumeDevice = config.fileSystems."/".device;
   boot.kernelParams = [ "resume_offset=589824" ];
 

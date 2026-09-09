@@ -1,10 +1,15 @@
 # iso.nix — GNOMS bootable installer ISO.
 #
 # A minimal NixOS CLI live environment with NetworkManager. It contains
-# almost nothing: the `gnoms` command clones the latest GNOMS from master
-# and runs the repo's own installer, so the ISO never goes stale.
+# almost nothing: the `gnoms` command clones GNOMS and runs the repo's own
+# installer, so the ISO never goes stale.
 #
-# Build:   nix build ./nixos#iso        (from the repo root)
+# Build:   installer/build-iso.sh       (from anywhere in the repo)
+#          → runs `nix build --impure ./nixos#iso` with GNOMS_REPO_URL set
+#            to this checkout's `git remote get-url origin`, so a fork's ISO
+#            defaults to that fork. A plain `nix build ./nixos#iso` (pure,
+#            no git remote known) also works — bootstrap.sh then falls back
+#            to its DEFAULT_REPO_URL, and the prompt lets you change it.
 # Result:  result/iso/*.iso
 {
   pkgs,
@@ -12,7 +17,20 @@
   modulesPath,
   ...
 }: let
-  gnoms = pkgs.writeShellScriptBin "gnoms" (builtins.readFile ./bootstrap.sh);
+  # Baked in at build time by build-iso.sh (needs --impure; "" in pure eval).
+  repoUrl = builtins.getEnv "GNOMS_REPO_URL";
+  repoBranch = builtins.getEnv "GNOMS_REPO_BRANCH";
+  # ui.sh (colors, prompts, logo banner) + bootstrap.sh, inlined in order.
+  gnoms = pkgs.writeShellScriptBin "gnoms" ''
+    export GNOMS_REPO_URL=${lib.escapeShellArg repoUrl}
+    export GNOMS_REPO_BRANCH=${lib.escapeShellArg repoBranch}
+    ${builtins.readFile ./ui.sh}
+    ${builtins.readFile ./bootstrap.sh}
+  '';
+  repoLine =
+    if repoUrl == ""
+    then "   Repo: bootstrap.sh default (the installer asks anyway)."
+    else "   Repo: ${repoUrl}";
 in {
   imports = [(modulesPath + "/installer/cd-dvd/installation-cd-minimal.nix")];
 
@@ -37,6 +55,10 @@ in {
   # for the session (Enter keeps this).
   console.keyMap = "no";
 
+  # The logo, referenced from the repo (ui.sh's banner reads it here on the
+  # ISO, and from <repo>/user/logo.txt once the repo is cloned).
+  environment.etc."gnoms/logo.txt".source = ../user/logo.txt;
+
   environment.systemPackages = with pkgs; [
     gnoms # the installer entry point
     git
@@ -57,6 +79,7 @@ in {
     │   'nmtui' to connect, then run 'gnoms' again.              │
     │                                                            │
     └────────────────────────────────────────────────────────────┘
+    ${repoLine}
 
   '';
 }
